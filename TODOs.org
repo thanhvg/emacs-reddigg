@@ -7,3 +7,14 @@ GET /r/subreddit.json
 GET /comment.json
 *** TODO json shape
 * get a subreddit json and list it in org buffer
+json-read and new native json produces different formats
+https://emacs.stackexchange.com/questions/27407/accessing-json-data-in-elisp
+#+begin_src elisp
+(require 'json)
+
+(let* ((json-object-type 'hash-table)
+       (json-array-type 'list)
+       (json-key-type 'string)
+       (json (json-read-file "test.json")))
+  (car (gethash "projects" json)))
+#+end_src
