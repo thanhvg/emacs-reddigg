@@ -1,0 +1,9 @@
+#+STARTUP:    content indent
+* reddit api 
+** read a subreddit
+GET /r/subreddit.json
+*** TODO json shape
+** read a comment
+GET /comment.json
+*** TODO json shape
+* get a subreddit json and list it in org buffer
