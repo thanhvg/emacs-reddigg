@@ -6,8 +6,7 @@ GET /r/subreddit.json
 ** read a comment
 GET /comment.json
 *** TODO json shape
-* get a subreddit json and list it in org buffer
-json-read and new native json produces different formats
+* TODO support emacs 26, json-read and new native json produces different formats
 https://emacs.stackexchange.com/questions/27407/accessing-json-data-in-elisp
 #+begin_src elisp
 (require 'json)
@@ -18,3 +17,12 @@ https://emacs.stackexchange.com/questions/27407/accessing-json-data-in-elisp
        (json (json-read-file "test.json")))
   (car (gethash "projects" json)))
 #+end_src
+* paging in list request
+https://www.reddit.com/dev/api#GET_hot
+* combination
+https://www.reddit.com/r/ACMilan+emacs/.json
+* TODO eww link
+* show comments
+https://www.reddit.com/r/emacs/comments/lg4iw6/emacs_keyboard_shortcuts_in_a_table_that_can_be.json
+
+[post, comment]
