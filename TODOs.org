@@ -26,3 +26,5 @@ https://www.reddit.com/r/ACMilan+emacs/.json
 https://www.reddit.com/r/emacs/comments/lg4iw6/emacs_keyboard_shortcuts_in_a_table_that_can_be.json
 
 [post, comment]
+
+* links from post to comments

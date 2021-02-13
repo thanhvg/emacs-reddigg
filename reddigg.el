@@ -3,7 +3,7 @@
 ;; Copyright (C) 2021  Thanh Vuong
 
 ;; Author: Thanh Vuong <thanhvg@gmail.com>
-;; URL: https://github.com/thanhvg/emacs-hnreader/
+;; URL: https://github.com/thanhvg/emacs-reddigg
 ;; Package-Requires: ((emacs "26.3") (promise "1.1") (ht "2.3") (request "0.3.0") (org "9.2"))
 ;; Version: 0.1
 
@@ -32,8 +32,7 @@
 (require 'ht)
 (require 'org)
 (require 'json)
-
-
+(require 'url-util)
 
 ;; https://github.com/flycheck/flycheck/pull/1723/files
 (defconst reddigg--json-parser
@@ -69,8 +68,8 @@
   "Promise a json from URL."
   (promise-new
    (lambda (resolve reject)
-     (request url
-       :headers `(("User-Agent" . "fun"))
+     (request (url-encode-url url)
+       :headers `(("User-Agent" . "emacs"))
        :parser 'reddigg--json-parser-fn
        ;; :parser 'json-read
        :error (cl-function (lambda (&rest args &key error-thrown &allow-other-keys)
@@ -111,7 +110,9 @@
              (setq begin (point))
              (insert "\n" selftext "\n")
              (setq end (point))
-             (reddigg--sanitize-range begin end)))))
+             (reddigg--sanitize-range begin end)))
+         (insert (format "[[elisp:(reddigg-view-comments \"%s\")][view comments]]\n"
+                         (ht-get my-it "permalink")))))
      data)))
 
 (defun reddigg--sanitize-range (begin end)
@@ -121,20 +122,6 @@
     (while (re-search-forward "^\\* " end t)
       (replace-match "- "))))
 
-(defun reddigg-show-sub (sub)
-  "Prompt SUB and print its post list."
-  (interactive "sQuery: ")
-  (promise-chain (reddigg--promise-posts sub)
-    (then (lambda (result)
-            ;; (setq thanh nil)
-            ;; (setq thanh result)
-            (gethash "children" (gethash "data" result))))
-    (then #'reddigg--print-sub)
-    (then (lambda (&rest _)
-            (switch-to-buffer (reddigg--get-buffer))))
-    (promise-catch (lambda (reason)
-                     (message "catch error in promise: %s" reason)))))
-
 (defun reddigg--print-comment-1 (data)
   "Print the post content from DATA."
   (let ((cmt (ht-get* (aref (ht-get* data "data" "children") 0) "data")))
@@ -142,19 +129,22 @@
 
 
 (defun reddigg--print-comment-list (cmt-list level)
-  "Pritn comments from CMT-LIST with LEVEL."
+  "Print comments from CMT-LIST with LEVEL."
   (seq-do
    (lambda (it)
-     (let* ((data (ht-get it "data"))
+     (let* ((kind (ht-get it "kind"))
+            (data (ht-get it "data"))
             (replies (ht-get data "replies"))
             begin end)
-       (insert level " " (ht-get data "author") "\n")
-       (setq begin (point))
-       (insert (ht-get data "body") "\n")
-       (setq end (point))
-       (reddigg--sanitize-range begin end)
-       (when (hash-table-p replies)
-         (reddigg--print-comment-list (ht-get* replies "data" "children") (concat level "*")))))
+       (if (string= kind "more")
+           (insert level " reddigg: too many subcomments\n")
+         (insert level " " (ht-get data "author") "\n")
+         (setq begin (point))
+         (insert (ht-get data "body") "\n")
+         (setq end (point))
+         (reddigg--sanitize-range begin end)
+         (when (hash-table-p replies)
+           (reddigg--print-comment-list (ht-get* replies "data" "children") (concat level "*"))))))
    cmt-list))
 
 (defun reddigg--print-comment-2 (data level)
@@ -172,18 +162,37 @@
 
 ;; r/emacs/comments/lg4iw6/emacs_keyboard_shortcuts_in_a_table_that_can_be
 
-(defun reddigg-show-comments (cmt)
-  "Aske and print CMT to buffer."
+(defun reddigg-view-comments (cmt)
+  "Ask and print CMT to buffer."
   (interactive "sQuery: ")
   (promise-chain (reddigg--promise-comments cmt)
     (then #'reddigg--print-comments)
     (then (lambda (&rest _)
-            (switch-to-buffer (reddigg--get-cmt-buffer))))
+            (select-window
+             (display-buffer
+              (reddigg--get-cmt-buffer)
+              '(display-buffer-use-some-window (inhibit-same-window . t))))))
     (promise-catch (lambda (reason)
                      (message "catch error in promise: %s" reason)))))
 
 
-(reddigg-show-comments "r/emacs/comments/lg4iw6/emacs_keyboard_shortcuts_in_a_table_that_can_be")
+;; (reddigg-view-comments "r/emacs/comments/lg4iw6/emacs_keyboard_shortcuts_in_a_table_that_can_be")
+
+;; (thread-first 'table (gethash "data") (gethash "children"))
+
+(defun reddigg-view-sub (sub)
+  "Prompt SUB and print its post list."
+  (interactive "sQuery: ")
+  (promise-chain (reddigg--promise-posts sub)
+    (then (lambda (result)
+            (ht-get* result "data" "children")))
+    (then #'reddigg--print-sub)
+    (then (lambda (&rest _)
+            (switch-to-buffer (reddigg--get-buffer))))
+    (promise-catch (lambda (reason)
+                     (message "catch error in promise: %s" reason)))))
+
+;; (reddigg-view-sub 'acmilan)
 
 (provide 'reddigg)
 ;;; reddigg.el ends here
