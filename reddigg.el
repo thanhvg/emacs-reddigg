@@ -43,27 +43,24 @@
   :link '(emacs-commentary-link "reddigg.el"))
 
 (defcustom reddigg-subs '(acmilan emacs starcraft)
-  "List of subreddits"
+  "List of subreddits."
   :type 'list
   :group 'reddigg)
 
-;; (setq reddigg-subs '(acmilan emacs starcraft))
-
-;; https://github.com/flycheck/flycheck/pull/1723/files
-(defconst reddigg--json-parser
-  (if (and (functionp 'json-parse-buffer)
-           ;; json-parse-buffer only supports keyword arguments in Emacs 27+
-           (>= emacs-major-version 27))
-      'json-parse-buffer
-    'json-read)
-  "Function to use to parse JSON strings.")
-
-(defun reddigg--json-parser-fn (&rest args)
-  "Parse json from buffer with ARGS."
-  (apply reddigg--json-parser args))
+(defun reddigg--parse-json-buffer ()
+  "Read json from buffer."
+  (if (fboundp 'json-parse-buffer)
+      (json-parse-buffer
+       :object-type 'hash-table
+       :null-object nil
+       :false-object nil)
+    (let ((json-array-type 'vector)
+          (json-object-type 'hash-table)
+          (json-false nil))
+      (json-read))))
 
 (defconst reddigg--sub-url
-  "https://www.reddit.com/r/%s.json"
+  "https://www.reddit.com/r/%s.json?count=25"
   "Sub reddit template.")
 
 (defconst reddigg--cmt-url
@@ -74,15 +71,15 @@
 ;;   "Promise SUB post list."
 ;;   (reddigg--promise-json (format reddigg--sub-url sub)))
 
-(cl-defun reddigg--promise-posts (sub &key after before) 
-  "Promise SUB post list."
+(cl-defun reddigg--promise-posts (sub &key after before)
+  "Promise SUB post list with keyword AFTER and BEFORE."
   (reddigg--promise-json
    (concat
     (format reddigg--sub-url sub)
     (when after
-      (concat "?after=" after))
+      (concat "&after=" after))
     (when before
-      (concat "?before=" before)))))
+      (concat "&before=" before)))))
 
 (defun reddigg--promise-comments (cmt)
   "Promise CMT list."
@@ -94,7 +91,7 @@
    (lambda (resolve reject)
      (request (url-encode-url url)
        :headers `(("User-Agent" . "emacs"))
-       :parser 'reddigg--json-parser-fn
+       :parser 'reddigg--parse-json-buffer
        ;; :parser 'json-read
        :error (cl-function (lambda (&rest args &key error-thrown &allow-other-keys)
                              (funcall reject  error-thrown)))
@@ -123,12 +120,16 @@
   "Get main buffer."
   (get-buffer-create reddigg--main-buffer))
 
-(defun reddigg--print-sub (data sub)
-  "Print sub post list in DATA for SUB."
+(defun reddigg--print-sub (data sub &optional append)
+  "Print sub post list in DATA for SUB.
+When APPEND is non-nil, will not delete buffer but append to it,
+after deleting the current line which should be the More button."
   (with-current-buffer (reddigg--get-buffer)
-    (erase-buffer)
-    (insert "#+startup: overview indent\n")
-    (insert "#+title: posts\n")
+    (if append
+        (kill-whole-line)
+     (erase-buffer)
+     (insert "#+startup: overview indent\n")
+     (insert "#+title: posts\n"))
     (seq-do
      (lambda (it)
        (let ((my-it (gethash "data" it)))
@@ -147,14 +148,9 @@
          (insert (format "[[elisp:(reddigg-view-comments \"%s\")][view comments]]\n"
                          (ht-get my-it "permalink")))))
      (ht-get data "children"))
-    (let ((after (ht-get data "after"))
-          (before (ht-get data "before")))
-      (insert "\* ")
-      (when before
-        (insert (format "[[elisp:(reddigg-view-sub-before \"%s\" \"%s\")][Previous]] " sub before)))
+    (let ((after (ht-get data "after")))
       (when after
-        (insert (format "[[elisp:(reddigg-view-sub-after \"%s\" \"%s\")][Next]]" sub after)))
-      )))
+        (insert (format "* [[elisp:(reddigg--view-sub-more \"%s\" \"%s\")][More]]" sub after))))))
 
 (defun reddigg--sanitize-range (begin end)
   "Remove heading * inside rang between BEGIN and END."
@@ -223,15 +219,18 @@
 
 ;; (reddigg--promise-posts "crap" :after "1" :before nil)
 
-(cl-defun reddigg--view-sub (sub &key after before)
-  "Prompt SUB and print its post list."
+(cl-defun reddigg--view-sub (sub &key after before append)
+  "Prompt SUB and print its post list.
+AFTER: fetch post after name.
+BEFORE: fetch posts before name
+APPEND: tell `reddigg--print-sub' to append."
   (interactive "sQuery: ")
   (promise-chain (reddigg--promise-posts sub :after after :before before)
     (then (lambda (result)
             (ht-get result "data")))
     (then (lambda (data)
-            (reddigg--print-sub data sub))
-     ;; #'reddigg--print-sub
+            (reddigg--print-sub data sub append))
+          ;; #'reddigg--print-sub
           )
     (then (lambda (&rest _)
             (switch-to-buffer (reddigg--get-buffer))))
@@ -244,13 +243,9 @@
   (interactive "sQuery: ")
   (reddigg--view-sub sub))
 
-(defun reddigg-view-sub-after (sub after)
-  "Prompt SUB and print its post list."
-  (reddigg--view-sub sub :after after))
-
-(defun reddigg-view-sub-before (sub before)
-  "Prompt SUB and print its post list."
-  (reddigg--view-sub sub :before before))
+(defun reddigg--view-sub-more (sub after)
+  "Fetch SUB from AFTER and appen."
+  (reddigg--view-sub sub :after after :append t))
 
 ;; (reddigg-view-sub 'acmilan)
 
