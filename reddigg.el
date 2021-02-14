@@ -67,9 +67,16 @@
   "https://www.reddit.com/%s.json"
   "Comment link template.")
 
-;; (defun reddigg--promise-posts (sub)
-;;   "Promise SUB post list."
-;;   (reddigg--promise-json (format reddigg--sub-url sub)))
+(defvar reddigg--template-sub "[[elisp:(reddigg-view-sub \"%s\")][%s]]\n"
+  "Template string for main.")
+
+(defun reddigg--ensure-modes ()
+  "Get a bunch of modes up and running."
+  (if (equal major-mode 'org-mode)
+      (org-set-startup-visibility)
+    (org-mode)
+    (font-lock-flush))
+  (visual-line-mode))
 
 (cl-defun reddigg--promise-posts (sub &key after before)
   "Promise SUB post list with keyword AFTER and BEFORE."
@@ -125,32 +132,36 @@
 When APPEND is non-nil, will not delete buffer but append to it,
 after deleting the current line which should be the More button."
   (with-current-buffer (reddigg--get-buffer)
-    (if append
-        (kill-whole-line)
-     (erase-buffer)
-     (insert "#+startup: overview indent\n")
-     (insert "#+title: posts\n"))
-    (seq-do
-     (lambda (it)
-       (let ((my-it (gethash "data" it)))
-         (insert "* " (gethash "title" my-it) "\n")
-         (insert "| " (ht-get my-it "subreddit_name_prefixed") " | ")
-         (insert "score: " (format "%s" (gethash "score" my-it) ) " | ")
-         (insert "comments: " (format "%s" (gethash "num_comments" my-it)) " |\n")
-         (let ((selftext (gethash "selftext" my-it)) begin end)
-           (if (string-empty-p selftext)
-               (insert (format "%s [[eww:%s][view in eww]]\n"
-                               (gethash "url" my-it) (gethash "url" my-it)))
-             (setq begin (point))
-             (insert "\n" selftext "\n")
-             (setq end (point))
-             (reddigg--sanitize-range begin end)))
-         (insert (format "[[elisp:(reddigg-view-comments \"%s\")][view comments]]\n"
-                         (ht-get my-it "permalink")))))
-     (ht-get data "children"))
-    (let ((after (ht-get data "after")))
-      (when after
-        (insert (format "* [[elisp:(reddigg--view-sub-more \"%s\" \"%s\")][More]]" sub after))))))
+    (save-excursion
+      (if append
+          (kill-whole-line)
+        (erase-buffer)
+        (insert "#+startup: overview indent\n")
+        (insert "#+title: posts\n")
+        (insert (format reddigg--template-sub sub "refresh")))
+
+      (seq-do
+       (lambda (it)
+         (let ((my-it (gethash "data" it)))
+           (insert "* " (gethash "title" my-it) "\n")
+           (insert "| " (ht-get my-it "subreddit_name_prefixed") " | ")
+           (insert "score: " (format "%s" (gethash "score" my-it) ) " | ")
+           (insert "comments: " (format "%s" (gethash "num_comments" my-it)) " |\n")
+           (let ((selftext (gethash "selftext" my-it)) begin end)
+             (if (string-empty-p selftext)
+                 (insert (format "%s \n[[eww:%s][view in eww]]\n"
+                                 (gethash "url" my-it) (gethash "url" my-it)))
+               (setq begin (point))
+               (insert "\n" selftext "\n")
+               (setq end (point))
+               (reddigg--sanitize-range begin end)))
+           (insert (format "[[elisp:(reddigg--view-comments \"%s\")][view comments]]\n"
+                           (ht-get my-it "permalink")))))
+       (ht-get data "children"))
+      (let ((after (ht-get data "after")))
+        (when after
+          (insert (format "* [[elisp:(reddigg--view-sub-more \"%s\" \"%s\")][More]]" sub after))))
+      (reddigg--ensure-modes))))
 
 (defun reddigg--sanitize-range (begin end)
   "Remove heading * inside rang between BEGIN and END."
@@ -158,12 +169,6 @@ after deleting the current line which should be the More button."
     (goto-char begin)
     (while (re-search-forward "^\\* " end t)
       (replace-match "- "))))
-
-(defun reddigg--print-comment-1 (data)
-  "Print the post content from DATA."
-  (let ((cmt (ht-get* (aref (ht-get* data "data" "children") 0) "data")))
-    (insert (gethash "selftext" cmt) "\n")))
-
 
 (defun reddigg--print-comment-list (cmt-list level)
   "Print comments from CMT-LIST with LEVEL."
@@ -184,6 +189,18 @@ after deleting the current line which should be the More button."
            (reddigg--print-comment-list (ht-get* replies "data" "children") (concat level "*"))))))
    cmt-list))
 
+(defun reddigg--print-comment-1 (data)
+  "Print the post content from DATA."
+  (let ((cmt (ht-get* (aref (ht-get* data "data" "children") 0) "data")) begin end)
+    (insert (ht-get cmt "url") "\n")
+    (insert "author: " (ht-get cmt "author") "\n")
+    (insert (format "[[elisp:(reddigg--view-comments \"%s\" t)][refresh]]\n"
+                    (ht-get cmt "permalink")))
+    (setq begin (point))
+    (insert (gethash "selftext" cmt) "\n")
+    (setq end (point))
+    (reddigg--sanitize-range begin end)))
+
 (defun reddigg--print-comment-2 (data level)
   "Extrac comment list from DATA and pass it along with LEVEL."
   (reddigg--print-comment-list (ht-get* data "data" "children") level))
@@ -195,20 +212,27 @@ after deleting the current line which should be the More button."
     (insert "#+startup: overview indent\n")
     (insert "#+title: comments\n")
     (reddigg--print-comment-1 (aref data 0))
-    (reddigg--print-comment-2 (aref data 1) "*")))
+    (reddigg--print-comment-2 (aref data 1) "*")
+    (reddigg--ensure-modes)))
 
 ;; r/emacs/comments/lg4iw6/emacs_keyboard_shortcuts_in_a_table_that_can_be
 
 (defun reddigg-view-comments (cmt)
   "Ask and print CMT to buffer."
-  (interactive "sQuery: ")
+  (interactive "sComent: ")
+  (reddigg--view-comments cmt))
+
+(defun reddigg--view-comments (cmt &optional new-window)
+  "Ask and print CMT to buffer. When NEW-WINDOW will show in new buffer."
   (promise-chain (reddigg--promise-comments cmt)
     (then #'reddigg--print-comments)
     (then (lambda (&rest _)
-            (select-window
-             (display-buffer
-              (reddigg--get-cmt-buffer)
-              '(display-buffer-use-some-window (inhibit-same-window . t))))))
+            (if new-window
+                (switch-to-buffer (reddigg--get-cmt-buffer))
+              (select-window
+               (display-buffer
+                (reddigg--get-cmt-buffer)
+                '(display-buffer-use-some-window (inhibit-same-window . t)))))))
     (promise-catch (lambda (reason)
                      (message "catch error in promise: %s" reason)))))
 
@@ -224,19 +248,16 @@ after deleting the current line which should be the More button."
 AFTER: fetch post after name.
 BEFORE: fetch posts before name
 APPEND: tell `reddigg--print-sub' to append."
-  (interactive "sQuery: ")
+  (interactive "sSubreddit: ")
   (promise-chain (reddigg--promise-posts sub :after after :before before)
     (then (lambda (result)
             (ht-get result "data")))
     (then (lambda (data)
-            (reddigg--print-sub data sub append))
-          ;; #'reddigg--print-sub
-          )
+            (reddigg--print-sub data sub append)))
     (then (lambda (&rest _)
             (switch-to-buffer (reddigg--get-buffer))))
     (promise-catch (lambda (reason)
                      (message "catch error in promise: %s" reason)))))
-
 
 (defun reddigg-view-sub (sub)
   "Prompt SUB and print its post list."
@@ -248,9 +269,6 @@ APPEND: tell `reddigg--print-sub' to append."
   (reddigg--view-sub sub :after after :append t))
 
 ;; (reddigg-view-sub 'acmilan)
-
-(defvar reddigg--template-sub "[[elisp:(reddigg-view-sub \"%s\")][%s]]\n"
-  "Template string for main.")
 
 ;; (setq reddigg--template-sub "[[elisp:(reddigg-view-sub \"%s\")][%s]]\n")
 (defun reddigg-view-main ()
@@ -264,9 +282,11 @@ APPEND: tell `reddigg--print-sub' to append."
     (insert (format reddigg--template-sub "popular" "popular"))
     (insert (format reddigg--template-sub (mapconcat #'symbol-name reddigg-subs "+") "main"))
     (dolist (sub reddigg-subs)
-      (insert (format reddigg--template-sub sub sub)))))
+      (insert (format reddigg--template-sub sub sub)))
+    (reddigg--ensure-modes))
+  (switch-to-buffer (reddigg--get-main-buffer)))
 
-(reddigg-view-main)
+;; (reddigg-view-main)
 
 (provide 'reddigg)
 ;;; reddigg.el ends here
