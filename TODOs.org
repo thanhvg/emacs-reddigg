@@ -28,3 +28,10 @@ https://www.reddit.com/r/emacs/comments/lg4iw6/emacs_keyboard_shortcuts_in_a_tab
 [post, comment]
 
 * links from post to comments
+* main page
+* add subreddit name to post
+* more button
+https://www.reddit.com/r/ACMilan+emacs/.json?after=t3_lhk6ng
+
+query also
+* refresh button

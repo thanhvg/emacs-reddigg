@@ -33,6 +33,21 @@
 (require 'org)
 (require 'json)
 (require 'url-util)
+;; (require 'subr-x)
+
+(defgroup reddigg nil
+  "Search and read stackoverflow and sisters's sites."
+  :group 'extensions
+  :group 'convenience
+  :version "26.1"
+  :link '(emacs-commentary-link "reddigg.el"))
+
+(defcustom reddigg-subs '(acmilan emacs starcraft)
+  "List of subreddits"
+  :type 'list
+  :group 'reddigg)
+
+;; (setq reddigg-subs '(acmilan emacs starcraft))
 
 ;; https://github.com/flycheck/flycheck/pull/1723/files
 (defconst reddigg--json-parser
@@ -55,10 +70,19 @@
   "https://www.reddit.com/%s.json"
   "Comment link template.")
 
+;; (defun reddigg--promise-posts (sub)
+;;   "Promise SUB post list."
+;;   (reddigg--promise-json (format reddigg--sub-url sub)))
 
-(defun reddigg--promise-posts (sub)
+(cl-defun reddigg--promise-posts (sub &key after before) 
   "Promise SUB post list."
-  (reddigg--promise-json (format reddigg--sub-url sub)))
+  (reddigg--promise-json
+   (concat
+    (format reddigg--sub-url sub)
+    (when after
+      (concat "?after=" after))
+    (when before
+      (concat "?before=" before)))))
 
 (defun reddigg--promise-comments (cmt)
   "Promise CMT list."
@@ -78,6 +102,9 @@
                                (message "got result")
                                (funcall resolve data)))))))
 
+(defvar reddigg--main-buffer "*reddigg-main*"
+  "Buffer for main page.")
+
 (defvar reddigg--buffer "*reddigg*"
   "Buffer for main page.")
 
@@ -92,28 +119,42 @@
   "Get buffer for comments."
   (get-buffer-create reddigg--cmt-buffer))
 
-(defun reddigg--print-sub (data)
-  "Print sub post list in DATA."
+(defun reddigg--get-main-buffer ()
+  "Get main buffer."
+  (get-buffer-create reddigg--main-buffer))
+
+(defun reddigg--print-sub (data sub)
+  "Print sub post list in DATA for SUB."
   (with-current-buffer (reddigg--get-buffer)
     (erase-buffer)
     (insert "#+startup: overview indent\n")
-    (insert "#+title: subreddit\n")
+    (insert "#+title: posts\n")
     (seq-do
      (lambda (it)
        (let ((my-it (gethash "data" it)))
          (insert "* " (gethash "title" my-it) "\n")
-         (insert "score: " (format "%s" (gethash "score" my-it) ) "\n")
-         (insert "comments: " (format "%s" (gethash "num_comments" my-it)) "\n")
+         (insert "| " (ht-get my-it "subreddit_name_prefixed") " | ")
+         (insert "score: " (format "%s" (gethash "score" my-it) ) " | ")
+         (insert "comments: " (format "%s" (gethash "num_comments" my-it)) " |\n")
          (let ((selftext (gethash "selftext" my-it)) begin end)
            (if (string-empty-p selftext)
-               (insert "url: " (gethash "url" my-it) "\n")
+               (insert (format "%s [[eww:%s][view in eww]]\n"
+                               (gethash "url" my-it) (gethash "url" my-it)))
              (setq begin (point))
              (insert "\n" selftext "\n")
              (setq end (point))
              (reddigg--sanitize-range begin end)))
          (insert (format "[[elisp:(reddigg-view-comments \"%s\")][view comments]]\n"
                          (ht-get my-it "permalink")))))
-     data)))
+     (ht-get data "children"))
+    (let ((after (ht-get data "after"))
+          (before (ht-get data "before")))
+      (insert "\* ")
+      (when before
+        (insert (format "[[elisp:(reddigg-view-sub-before \"%s\" \"%s\")][Previous]] " sub before)))
+      (when after
+        (insert (format "[[elisp:(reddigg-view-sub-after \"%s\" \"%s\")][Next]]" sub after)))
+      )))
 
 (defun reddigg--sanitize-range (begin end)
   "Remove heading * inside rang between BEGIN and END."
@@ -180,19 +221,57 @@
 
 ;; (thread-first 'table (gethash "data") (gethash "children"))
 
-(defun reddigg-view-sub (sub)
+;; (reddigg--promise-posts "crap" :after "1" :before nil)
+
+(cl-defun reddigg--view-sub (sub &key after before)
   "Prompt SUB and print its post list."
   (interactive "sQuery: ")
-  (promise-chain (reddigg--promise-posts sub)
+  (promise-chain (reddigg--promise-posts sub :after after :before before)
     (then (lambda (result)
-            (ht-get* result "data" "children")))
-    (then #'reddigg--print-sub)
+            (ht-get result "data")))
+    (then (lambda (data)
+            (reddigg--print-sub data sub))
+     ;; #'reddigg--print-sub
+          )
     (then (lambda (&rest _)
             (switch-to-buffer (reddigg--get-buffer))))
     (promise-catch (lambda (reason)
                      (message "catch error in promise: %s" reason)))))
 
+
+(defun reddigg-view-sub (sub)
+  "Prompt SUB and print its post list."
+  (interactive "sQuery: ")
+  (reddigg--view-sub sub))
+
+(defun reddigg-view-sub-after (sub after)
+  "Prompt SUB and print its post list."
+  (reddigg--view-sub sub :after after))
+
+(defun reddigg-view-sub-before (sub before)
+  "Prompt SUB and print its post list."
+  (reddigg--view-sub sub :before before))
+
 ;; (reddigg-view-sub 'acmilan)
+
+(defvar reddigg--template-sub "[[elisp:(reddigg-view-sub \"%s\")][%s]]\n"
+  "Template string for main.")
+
+;; (setq reddigg--template-sub "[[elisp:(reddigg-view-sub \"%s\")][%s]]\n")
+(defun reddigg-view-main ()
+  "View main page."
+  (interactive)
+  (with-current-buffer (reddigg--get-main-buffer)
+    (erase-buffer)
+    (insert "#+startup: overview indent\n")
+    (insert "#+title: main\n\n")
+    (insert (format reddigg--template-sub "all" "all"))
+    (insert (format reddigg--template-sub "popular" "popular"))
+    (insert (format reddigg--template-sub (mapconcat #'symbol-name reddigg-subs "+") "main"))
+    (dolist (sub reddigg-subs)
+      (insert (format reddigg--template-sub sub sub)))))
+
+(reddigg-view-main)
 
 (provide 'reddigg)
 ;;; reddigg.el ends here
