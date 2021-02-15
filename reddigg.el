@@ -236,6 +236,7 @@ after deleting the current line which should be the More button."
     (reddigg--print-comment-2 (aref data 1) "*")
     (reddigg--ensure-modes)))
 
+;;;###autoload
 (defun reddigg-view-comments (cmt)
   "Ask and print CMT to buffer."
   (interactive "sComent: ")
@@ -271,6 +272,7 @@ APPEND: tell `reddigg--print-sub' to append."
     (promise-catch (lambda (reason)
                      (message "catch error in promise: %s" reason)))))
 
+;;;###autoload
 (defun reddigg-view-sub (sub)
   "Prompt SUB and print its post list."
   (interactive "sSubreddit: ")
@@ -280,6 +282,7 @@ APPEND: tell `reddigg--print-sub' to append."
   "Fetch SUB from AFTER and appen."
   (reddigg--view-sub sub :after after :append t))
 
+;;;###autoload
 (defun reddigg-view-main ()
   "View main page."
   (interactive)
