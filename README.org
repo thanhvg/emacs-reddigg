@@ -4,6 +4,9 @@
 
 [[file:media/screenshot.png]]
 
+
+[[file:media/screencast.gif]]
+
 * Intro
 This package allows you to browse reddit in org-mode.
 * Install
