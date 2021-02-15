@@ -215,8 +215,6 @@ after deleting the current line which should be the More button."
     (reddigg--print-comment-2 (aref data 1) "*")
     (reddigg--ensure-modes)))
 
-;; r/emacs/comments/lg4iw6/emacs_keyboard_shortcuts_in_a_table_that_can_be
-
 (defun reddigg-view-comments (cmt)
   "Ask and print CMT to buffer."
   (interactive "sComent: ")
@@ -237,18 +235,11 @@ after deleting the current line which should be the More button."
                      (message "catch error in promise: %s" reason)))))
 
 
-;; (reddigg-view-comments "r/emacs/comments/lg4iw6/emacs_keyboard_shortcuts_in_a_table_that_can_be")
-
-;; (thread-first 'table (gethash "data") (gethash "children"))
-
-;; (reddigg--promise-posts "crap" :after "1" :before nil)
-
 (cl-defun reddigg--view-sub (sub &key after before append)
-  "Prompt SUB and print its post list.
+  "Fetch SUB and print its post list.
 AFTER: fetch post after name.
 BEFORE: fetch posts before name
 APPEND: tell `reddigg--print-sub' to append."
-  (interactive "sSubreddit: ")
   (promise-chain (reddigg--promise-posts sub :after after :before before)
     (then (lambda (result)
             (ht-get result "data")))
@@ -261,16 +252,13 @@ APPEND: tell `reddigg--print-sub' to append."
 
 (defun reddigg-view-sub (sub)
   "Prompt SUB and print its post list."
-  (interactive "sQuery: ")
+  (interactive "sSubreddit: ")
   (reddigg--view-sub sub))
 
 (defun reddigg--view-sub-more (sub after)
   "Fetch SUB from AFTER and appen."
   (reddigg--view-sub sub :after after :append t))
 
-;; (reddigg-view-sub 'acmilan)
-
-;; (setq reddigg--template-sub "[[elisp:(reddigg-view-sub \"%s\")][%s]]\n")
 (defun reddigg-view-main ()
   "View main page."
   (interactive)
@@ -285,8 +273,6 @@ APPEND: tell `reddigg--print-sub' to append."
       (insert (format reddigg--template-sub sub sub)))
     (reddigg--ensure-modes))
   (switch-to-buffer (reddigg--get-main-buffer)))
-
-;; (reddigg-view-main)
 
 (provide 'reddigg)
 ;;; reddigg.el ends here
