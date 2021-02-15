@@ -61,9 +61,7 @@
 
 (defgroup reddigg nil
   "Search and read stackoverflow and sisters's sites."
-  :group 'extensions
   :group 'convenience
-  :version "26.1"
   :link '(emacs-commentary-link "reddigg.el"))
 
 (defcustom reddigg-subs '(acmilan emacs starcraft)
