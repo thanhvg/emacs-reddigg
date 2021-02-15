@@ -1,5 +1,9 @@
 #+STARTUP: content indent
 
+[[http://spacemacs.org][file:https://cdn.rawgit.com/syl20bnr/spacemacs/442d025779da2f62fc86c2082703697714db6514/assets/spacemacs-badge.svg]]
+
+[[file:media/screenshot.png]]
+
 * Intro
 This package allows you to browse reddit in org-mode.
 * Install
@@ -8,8 +12,7 @@ Spacemacs
 * Buffers
 There are three buffers which are on org-mode. They show links and elisp
 commands which will run when you enter/click (~org-open-at-point~) on them. By
-default org-mode will ask you for confirmation. You can disable org confirm
-message on clicking:
+default org-mode will ask you for confirmation. You can disable it:
 
 #+begin_example elsip
 (setq org-confirm-elisp-link-function nil)

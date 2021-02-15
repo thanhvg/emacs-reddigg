@@ -6,7 +6,7 @@ GET /r/subreddit.json
 ** read a comment
 GET /comment.json
 *** TODO json shape
-* TODO support emacs 26, json-read and new native json produces different formats
+* DONE support emacs 26, json-read and new native json produces different formats
 https://emacs.stackexchange.com/questions/27407/accessing-json-data-in-elisp
 #+begin_src elisp
 (require 'json)
@@ -21,7 +21,7 @@ https://emacs.stackexchange.com/questions/27407/accessing-json-data-in-elisp
 https://www.reddit.com/dev/api#GET_hot
 * combination
 https://www.reddit.com/r/ACMilan+emacs/.json
-* TODO eww link
+* DONE eww link
 * show comments
 https://www.reddit.com/r/emacs/comments/lg4iw6/emacs_keyboard_shortcuts_in_a_table_that_can_be.json
 
@@ -36,3 +36,6 @@ https://www.reddit.com/r/ACMilan+emacs/.json?after=t3_lhk6ng
 query also
 * refresh button
 + on comments
+* test json parser for 26
+* TODO remove HTML chars
+&gt; 
