@@ -57,7 +57,6 @@
 (require 'org)
 (require 'json)
 (require 'url-util)
-(require 'subr)
 
 (defgroup reddigg nil
   "Search and read stackoverflow and sisters's sites."
