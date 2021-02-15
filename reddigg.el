@@ -40,7 +40,9 @@
 ;; reddigg-view-sub: prompt for a subreddits and show it,
 ;;
 ;; reddigg-view-comments: prompt for a post (eg:
-;; r/emacs/comments/lfww57/weekly_tipstricketc_thread/) and show it.
+;; r/emacs/comments/lfww57/weekly_tipstricketc_thread/ or
+;; https://www.reddit.com/r/emacs/comments/lfww57/weekly_tipstricketc_thread/)
+;; and show it.
 ;;
 ;; * Remarks
 ;; This mode only lets you view reddit. For a complete interaction with reddit check
@@ -55,6 +57,7 @@
 (require 'org)
 (require 'json)
 (require 'url-util)
+(require 'subr)
 
 (defgroup reddigg nil
   "Search and read stackoverflow and sisters's sites."
@@ -240,6 +243,10 @@ after deleting the current line which should be the More button."
 (defun reddigg-view-comments (cmt)
   "Ask and print CMT to buffer."
   (interactive "sComent: ")
+  (when (string-prefix-p "https" cmt)
+    (setq cmt
+          (substring cmt
+                     (length "https://www.reddit.com/") nil)))
   (reddigg--view-comments cmt))
 
 (defun reddigg--view-comments (cmt &optional new-window)
