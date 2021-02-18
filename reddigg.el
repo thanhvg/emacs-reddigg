@@ -124,7 +124,6 @@
        :error (cl-function (lambda (&rest args &key error-thrown &allow-other-keys)
                              (funcall reject  error-thrown)))
        :success (cl-function (lambda (&key data &allow-other-keys)
-                               (message "got result")
                                (funcall resolve data)))))))
 
 (defvar reddigg--main-buffer "*reddigg-main*"
