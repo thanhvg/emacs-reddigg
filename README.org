@@ -11,8 +11,14 @@
 * Intro
 This package allows you to browse reddit in org-mode.
 * Install
-MELPA pending
-Spacemacs
+MELPA
+
+[[https://melpa.org/#/reddigg][file:https://melpa.org/packages/reddigg-badge.svg]]
+
+Spacemacs layer:
+
+https://github.com/thanhvg/spacemacs-eos
+
 * Buffers
 There are three buffers which are on org-mode. They show links and elisp
 commands which will run when you enter/click (~org-open-at-point~) on them. By
