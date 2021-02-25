@@ -37,5 +37,10 @@ query also
 * refresh button
 + on comments
 * test json parser for 26
-* TODO remove HTML chars
-&gt; 
+* DONE remove HTML chars
+CLOSED: [2021-02-25 Thu 12:47]
+&gt; => quote mark
+
+&amp;nbsp; => new line
+* TODO load more comments
+instead of reddigg too many comments

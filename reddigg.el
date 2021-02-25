@@ -99,6 +99,15 @@
     (font-lock-flush))
   (visual-line-mode))
 
+(defvar reddigg-replacement-list
+  '(("^\\* " . "- ")
+    ("&gt;" . ">")
+    ("&lt;" . "<")
+    ("&amp;#x200B;" . "\n")
+    ("&amp;nbsp;" . "\n")
+    ("&amp;" . "&"))
+  "List of (find . replace) to sanitize the text in range.")
+
 (cl-defun reddigg--promise-posts (sub &key after before)
   "Promise SUB post list with keyword AFTER and BEFORE."
   (reddigg--promise-json
@@ -186,9 +195,10 @@ after deleting the current line which should be the More button."
 (defun reddigg--sanitize-range (begin end)
   "Remove heading * inside rang between BEGIN and END."
   (save-excursion
-    (goto-char begin)
-    (while (re-search-forward "^\\* " end t)
-      (replace-match "- "))))
+    (dolist (it reddigg-replacement-list)
+        (goto-char begin)
+     (while (re-search-forward (car it) end t)
+       (replace-match (cdr it))))))
 
 (defun reddigg--print-comment-list (cmt-list level)
   "Print comments from CMT-LIST with LEVEL."
