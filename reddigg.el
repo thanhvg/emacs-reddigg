@@ -248,7 +248,7 @@ after deleting the current line which should be the More button."
 ;;;###autoload
 (defun reddigg-view-comments (cmt)
   "Ask and print CMT to buffer."
-  (interactive "sComent: ")
+  (interactive "sComment: ")
   (when (string-prefix-p "https" cmt)
     (setq cmt
           (substring cmt
