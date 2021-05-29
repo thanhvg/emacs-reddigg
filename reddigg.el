@@ -88,6 +88,10 @@
   "https://www.reddit.com/%s.json"
   "Comment link template.")
 
+(defconst reddigg--cmt-more-url
+  "https://api.reddit.com/api/morechildren?api_type=json&link_id=%s&children=%s"
+  "More comment link template.")
+
 (defvar reddigg--template-sub "[[elisp:(reddigg-view-sub \"%s\")][%s]]\n"
   "Template string for main.")
 
@@ -108,6 +112,9 @@
     ("&amp;" . "&"))
   "List of (find . replace) to sanitize the text in range.")
 
+(defvar-local reddigg--cmt-list-id nil
+  "ID/name of the current comment list.")
+
 (cl-defun reddigg--promise-posts (sub &key after before)
   "Promise SUB post list with keyword AFTER and BEFORE."
   (reddigg--promise-json
@@ -121,6 +128,12 @@
 (defun reddigg--promise-comments (cmt)
   "Promise CMT list."
   (reddigg--promise-json (format reddigg--cmt-url cmt)))
+
+(defun reddigg--promise-more-comments (children)
+  "Promise more comment list for CHILDREN."
+  (reddigg--promise-json (format reddigg--cmt-more-url
+                                 reddigg--cmt-list-id
+                                 children)))
 
 (defun reddigg--promise-json (url)
   "Promise a json from URL."
@@ -196,9 +209,9 @@ after deleting the current line which should be the More button."
   "Remove heading * inside rang between BEGIN and END."
   (save-excursion
     (dolist (it reddigg-replacement-list)
-        (goto-char begin)
-     (while (re-search-forward (car it) end t)
-       (replace-match (cdr it))))))
+      (goto-char begin)
+      (while (re-search-forward (car it) end t)
+        (replace-match (cdr it))))))
 
 (defun reddigg--print-comment-list (cmt-list level)
   "Print comments from CMT-LIST with LEVEL."
@@ -209,7 +222,13 @@ after deleting the current line which should be the More button."
             (replies (ht-get data "replies"))
             begin end)
        (if (string= kind "more")
-           (insert level " reddigg: too many subcomments\n")
+           ;; (insert level " reddigg: too many subcomments\n")
+           (insert
+            level (format " [[elisp:(reddigg--view-more-cmts \"%s\" \"%s\")][load more comments (%s)]]\n"
+                          level
+                          (mapconcat #'identity (ht-get data "children") ",")
+                          (ht-get data "count")))
+
          (insert level " " (ht-get data "author") "\n")
          (setq begin (point))
          (insert (ht-get data "body") "\n")
@@ -226,6 +245,7 @@ after deleting the current line which should be the More button."
     (insert "author: " (ht-get cmt "author") "\n")
     (insert (format "[[elisp:(reddigg--view-comments \"%s\" t)][refresh]]\n"
                     (ht-get cmt "permalink")))
+    (setq reddigg--cmt-list-id (ht-get cmt "name"))
     (setq begin (point))
     (insert (gethash "selftext" cmt) "\n")
     (setq end (point))
@@ -282,6 +302,18 @@ APPEND: tell `reddigg--print-sub' to append."
             (reddigg--print-sub data sub append)))
     (then (lambda (&rest _)
             (switch-to-buffer (reddigg--get-buffer))))
+    (promise-catch (lambda (reason)
+                     (message "catch error in promise: %s" reason)))))
+
+(defun reddigg--view-more-cmts (level children)
+  "Get more comments from CHILDREN and print at LEVEL."
+  (promise-chain (reddigg--promise-more-comments children)
+    (then (lambda (result)
+            (ht-get* result "json" "data" "things")))
+    (then (lambda (result)
+            (kill-whole-line)
+            (save-excursion
+              (reddigg--print-comment-list result level))))
     (promise-catch (lambda (reason)
                      (message "catch error in promise: %s" reason)))))
 

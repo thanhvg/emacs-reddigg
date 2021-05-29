@@ -42,5 +42,40 @@ CLOSED: [2021-02-25 Thu 12:47]
 &gt; => quote mark
 
 &amp;nbsp; => new line
-* TODO load more comments
+* DONE load more comments
+CLOSED: [2021-05-29 Sat 00:59]
 instead of reddigg too many comments
+https://api.reddit.com/comments/67k25q/api/morechildren?api_type=json&showmore=true&link_id=t3_67k25q
+
+https://api.reddit.com/comments/nmvx0x/api/morechildren?link_id=t3_nmvx0x&children=gztk5zv&id=gztk5zv&limit_children=true
+
+
+https://www.reddit.com/api/morechildren?link_id=t3_nmvx0x&sort=confidence&children=gztk5zv&id=t1_gztk5zv&limit_children=False
+
+https://api.reddit.com/api/morechildren?link_id=t3_nmvx0x&children=gztk5zv&api_type=json&jaw_json=1
+
+kind: "more"
+data {
+  count: 1
+  name: t1_gztk5zv
+  id: gztk5zv
+  parent_id: t1_gzr7eu8
+  depth: 2
+  children: ["gztk5zv"]
+}
+
+
+kind: "more"
+data {
+  count: 3
+  name: t1_gzth9jj
+  id: gzth9jj
+  parent_id: t1_gzqxdxj
+  depth: 1
+  children: [gzth9jj, gzs873z]
+}
+
+we need buffer local var to keep track of link/name id
+
+https://api.reddit.com/api/morechildren?link_id=t3_nmvx0x&children=gzth9jj,gzs873z&api_type=json
+https://api.reddit.com/api/morechildren?link_id=t3_nmvx0x&children=gzth9jj,gzs873z&api_type=json
