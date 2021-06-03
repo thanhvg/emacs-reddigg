@@ -239,17 +239,19 @@ after deleting the current line which should be the More button."
    cmt-list))
 
 (defun reddigg--print-comment-1 (data)
-  "Print the post content from DATA."
+  "Print the post content from DATA.
+Return a value of `reddigg--cmt-list-id'"
   (let ((cmt (ht-get* (aref (ht-get* data "data" "children") 0) "data")) begin end)
     (insert (ht-get cmt "url") "\n")
     (insert "author: " (ht-get cmt "author") "\n")
     (insert (format "[[elisp:(reddigg--view-comments \"%s\" t)][refresh]]\n"
                     (ht-get cmt "permalink")))
-    (setq reddigg--cmt-list-id (ht-get cmt "name"))
     (setq begin (point))
     (insert (gethash "selftext" cmt) "\n")
     (setq end (point))
-    (reddigg--sanitize-range begin end)))
+    (reddigg--sanitize-range begin end)
+    ;; get value for `reddigg--cmt-list-id'
+    (ht-get cmt "name")))
 
 (defun reddigg--print-comment-2 (data level)
   "Extrac comment list from DATA and pass it along with LEVEL."
@@ -261,9 +263,12 @@ after deleting the current line which should be the More button."
     (erase-buffer)
     (insert "#+startup: overview indent\n")
     (insert "#+title: comments\n")
-    (reddigg--print-comment-1 (aref data 0))
-    (reddigg--print-comment-2 (aref data 1) "*")
-    (reddigg--ensure-modes)))
+    (let ((post-id (reddigg--print-comment-1 (aref data 0))))
+     (reddigg--print-comment-2 (aref data 1) "*")
+     (reddigg--ensure-modes)
+     ;; must set here after org-mode is in otherwise when org-mode kicks in all
+     ;; local variables will be killed
+     (setq reddigg--cmt-list-id post-id))))
 
 ;;;###autoload
 (defun reddigg-view-comments (cmt)
