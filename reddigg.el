@@ -5,7 +5,7 @@
 ;; Author: Thanh Vuong <thanhvg@gmail.com>
 ;; URL: https://github.com/thanhvg/emacs-reddigg
 ;; Package-Requires: ((emacs "26.3") (promise "1.1") (ht "2.3") (request "0.3.0") (org "9.2"))
-;; Version: 0.1
+;; Version: 0.2
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -220,16 +220,18 @@ after deleting the current line which should be the More button."
      (let* ((kind (ht-get it "kind"))
             (data (ht-get it "data"))
             (replies (ht-get data "replies"))
+            (depth (ht-get data "depth"))
+            (my-level (make-string (1+ depth) ?*))
             begin end)
        (if (string= kind "more")
            ;; (insert level " reddigg: too many subcomments\n")
-           (insert
-            level (format " [[elisp:(reddigg--view-more-cmts \"%s\" \"%s\")][load more comments (%s)]]\n"
+           (insert my-level
+                   (format " [[elisp:(reddigg--view-more-cmts \"%s\" \"%s\")][load more comments (%s)]]\n"
                           level
                           (mapconcat #'identity (ht-get data "children") ",")
                           (ht-get data "count")))
 
-         (insert level " " (ht-get data "author") "\n")
+         (insert my-level " " (ht-get data "author") "\n")
          (setq begin (point))
          (insert (ht-get data "body") "\n")
          (setq end (point))

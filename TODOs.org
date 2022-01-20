@@ -79,3 +79,6 @@ we need buffer local var to keep track of link/name id
 
 https://api.reddit.com/api/morechildren?link_id=t3_nmvx0x&children=gzth9jj,gzs873z&api_type=json
 https://api.reddit.com/api/morechildren?link_id=t3_nmvx0x&children=gzth9jj,gzs873z&api_type=json
+
+* TODO retire the level functon argument in reddigg--print-comment-list
+it now gets the level from the data, no need to pass it around
