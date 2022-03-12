@@ -5,7 +5,7 @@
 ;; Author: Thanh Vuong <thanhvg@gmail.com>
 ;; URL: https://github.com/thanhvg/emacs-reddigg
 ;; Package-Requires: ((emacs "26.3") (promise "1.1") (ht "2.3") (request "0.3.0") (org "9.2"))
-;; Version: 0.2
+;; Version: 0.3
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -38,6 +38,8 @@
 ;; r/popular are included.
 ;;
 ;; reddigg-view-sub: prompt for a subreddits and show it,
+;;
+;; reddigg-view-frontpage: view frontpage
 ;;
 ;; reddigg-view-comments: prompt for a post (eg:
 ;; r/emacs/comments/lfww57/weekly_tipstricketc_thread/ or
@@ -329,6 +331,12 @@ APPEND: tell `reddigg--print-sub' to append."
   "Prompt SUB and print its post list."
   (interactive "sSubreddit: ")
   (reddigg--view-sub sub))
+
+;;;###autoload
+(defun reddigg-view-frontpage ()
+  "View frontpage."
+  (interactive)
+  (reddigg--view-sub (mapconcat #'symbol-name reddigg-subs "+")))
 
 (defun reddigg--view-sub-more (sub after)
   "Fetch SUB from AFTER and appen."
