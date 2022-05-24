@@ -82,3 +82,7 @@ https://api.reddit.com/api/morechildren?link_id=t3_nmvx0x&children=gzth9jj,gzs87
 
 * TODO retire the level functon argument in reddigg--print-comment-list
 it now gets the level from the data, no need to pass it around
+
+* TODO search
+https://www.reddit.com/r/emacs/search.json?q=what&restrict_sr=on&sort=relevance&t=all
+https://github.com/thanhvg/emacs-reddigg/issues/5
