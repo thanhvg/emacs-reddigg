@@ -5,7 +5,7 @@
 ;; Author: Thanh Vuong <thanhvg@gmail.com>
 ;; URL: https://github.com/thanhvg/emacs-reddigg
 ;; Package-Requires: ((emacs "26.3") (promise "1.1") (ht "2.3") (request "0.3.0") (org "9.2"))
-;; Version: 0.3
+;; Version: 0.3.1
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -346,17 +346,18 @@ APPEND: tell `reddigg--print-sub' to append."
 (defun reddigg-view-main ()
   "View main page."
   (interactive)
-  (with-current-buffer (reddigg--get-main-buffer)
-    (erase-buffer)
-    (insert "#+startup: overview indent\n")
-    (insert "#+title: main\n\n")
-    (insert (format reddigg--template-sub "all" "all"))
-    (insert (format reddigg--template-sub "popular" "popular"))
-    (insert (format reddigg--template-sub (mapconcat #'symbol-name reddigg-subs "+") "main"))
-    (dolist (sub reddigg-subs)
-      (insert (format reddigg--template-sub sub sub)))
-    (reddigg--ensure-modes))
-  (switch-to-buffer (reddigg--get-main-buffer)))
+  (switch-to-buffer (or (get-buffer reddigg--main-buffer)
+                        (with-current-buffer (reddigg--get-main-buffer)
+                          (erase-buffer)
+                          (insert "#+startup: overview indent\n")
+                          (insert "#+title: main\n\n")
+                          (insert (format reddigg--template-sub "all" "all"))
+                          (insert (format reddigg--template-sub "popular" "popular"))
+                          (insert (format reddigg--template-sub (mapconcat #'symbol-name reddigg-subs "+") "main"))
+                          (dolist (sub reddigg-subs)
+                            (insert (format reddigg--template-sub sub sub)))
+                          (reddigg--ensure-modes)
+                          reddigg--main-buffer))))
 
 (provide 'reddigg)
 ;;; reddigg.el ends here
