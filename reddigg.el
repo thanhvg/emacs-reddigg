@@ -266,7 +266,8 @@ Return a value of `reddigg--cmt-list-id'"
   (with-current-buffer (reddigg--get-cmt-buffer)
     (erase-buffer)
     (insert "#+startup: overview indent\n")
-    (insert "#+title: comments\n")
+    (insert (format "#+title: comments for '%s'\n"
+                    (ht-get* (aref (ht-get* (aref data 0) "data" "children") 0) "data" "title")))
     (let ((post-id (reddigg--print-comment-1 (aref data 0))))
      (reddigg--print-comment-2 (aref data 1) "*")
      (reddigg--ensure-modes)
