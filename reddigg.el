@@ -61,13 +61,27 @@
 (require 'url-util)
 
 (defgroup reddigg nil
-  "Search and read stackoverflow and sisters's sites."
+  "Browse reddit using org-mode."
   :group 'convenience
   :link '(emacs-commentary-link "reddigg.el"))
 
 (defcustom reddigg-subs '(acmilan emacs starcraft)
   "List of subreddits."
   :type 'list
+  :group 'reddigg)
+
+(defcustom reddigg-convert-md-to-org nil
+  "Convert Reddit markdown to org-mode using Pandoc.
+This requires Pandoc to be installed on your system. Also see
+`reddigg-pandoc-command'.  Enabling this may slow down the
+initialization of reddigg buffers with too may comments as there
+is an external process being called per comment."
+  :type 'string
+  :group 'reddigg)
+
+(defcustom reddigg-pandoc-command "pandoc -f markdown -t org"
+  "Command to convert Markdown into Org-mode markup."
+  :type 'string
   :group 'reddigg)
 
 (defun reddigg--parse-json-buffer ()
@@ -171,6 +185,22 @@
   "Get main buffer."
   (get-buffer-create reddigg--main-buffer))
 
+(defun reddigg--convert-md-to-org (md)
+  "Convert given MD string into org-mode string."
+  (with-temp-buffer
+    (insert md)
+    (shell-command-on-region
+     (point-min) (point-max)
+     reddigg-pandoc-command
+     nil t)
+    (buffer-string)))
+
+(defun reddigg--print-text (text)
+  "Format TEXT based on user preference."
+  (if reddigg-convert-md-to-org
+      (reddigg--convert-md-to-org text)
+    text))
+
 (defun reddigg--print-sub (data sub &optional append)
   "Print sub post list in DATA for SUB.
 When APPEND is non-nil, will not delete buffer but append to it,
@@ -196,7 +226,7 @@ after deleting the current line which should be the More button."
                  (insert (format "%s \n[[eww:%s][view in eww]]\n"
                                  (gethash "url" my-it) (gethash "url" my-it)))
                (setq begin (point))
-               (insert "\n" selftext "\n")
+               (insert "\n" (reddigg--print-text selftext) "\n")
                (setq end (point))
                (reddigg--sanitize-range begin end)))
            (insert (format "[[elisp:(reddigg--view-comments \"%s\")][view comments]]\n"
@@ -235,7 +265,7 @@ after deleting the current line which should be the More button."
 
          (insert my-level " " (ht-get data "author") "\n")
          (setq begin (point))
-         (insert (ht-get data "body") "\n")
+         (insert (reddigg--print-text (ht-get data "body")) "\n")
          (setq end (point))
          (reddigg--sanitize-range begin end)
          (when (hash-table-p replies)
@@ -251,7 +281,7 @@ Return a value of `reddigg--cmt-list-id'"
     (insert (format "[[elisp:(reddigg--view-comments \"%s\" t)][refresh]]\n"
                     (ht-get cmt "permalink")))
     (setq begin (point))
-    (insert (gethash "selftext" cmt) "\n")
+    (insert (reddigg--print-text (gethash "selftext" cmt)) "\n")
     (setq end (point))
     (reddigg--sanitize-range begin end)
     ;; get value for `reddigg--cmt-list-id'
