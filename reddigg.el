@@ -110,7 +110,7 @@
     ("&gt;" . ">")
     ("&lt;" . "<")
     ("&amp;#x200B;" . "\n")
-    ("&amp;nbsp;" . "\n")
+    ("&amp;nbsp;" . "\n") 
     ("&amp;" . "&"))
   "List of (find . replace) to sanitize the text in range.")
 
@@ -187,7 +187,7 @@ after deleting the current line which should be the More button."
       (seq-do
        (lambda (it)
          (let ((my-it (gethash "data" it)))
-           (insert "* " (gethash "title" my-it) "\n")
+           (insert "* " (format-time-string "%Y-%m-%d" (gethash "created_utc" my-it)) " :: " (gethash "title" my-it) "\n")
            (insert "| " (ht-get my-it "subreddit_name_prefixed") " | ")
            (insert "score: " (format "%s" (gethash "score" my-it) ) " | ")
            (insert "comments: " (format "%s" (gethash "num_comments" my-it)) " |\n")
