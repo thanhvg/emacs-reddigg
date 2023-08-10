@@ -10,6 +10,10 @@
 
 * Intro
 This package allows you to browse reddit in org-mode.
+
+* Warning
+As reddit no longer provides free APIs, this package may stop working in the near future.
+
 * Install
 MELPA
 

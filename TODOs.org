@@ -86,3 +86,7 @@ it now gets the level from the data, no need to pass it around
 * TODO search
 https://www.reddit.com/r/emacs/search.json?q=what&restrict_sr=on&sort=relevance&t=all
 https://github.com/thanhvg/emacs-reddigg/issues/5
+* blocked requests 
+
+requests www.reddit.com will get react app
+must use old.reddit.com

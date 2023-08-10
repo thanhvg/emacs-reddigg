@@ -5,7 +5,7 @@
 ;; Author: Thanh Vuong <thanhvg@gmail.com>
 ;; URL: https://github.com/thanhvg/emacs-reddigg
 ;; Package-Requires: ((emacs "26.3") (promise "1.1") (ht "2.3") (request "0.3.0") (org "9.2"))
-;; Version: 0.3.1
+;; Version: 0.4.0
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -43,7 +43,7 @@
 ;;
 ;; reddigg-view-comments: prompt for a post (eg:
 ;; r/emacs/comments/lfww57/weekly_tipstricketc_thread/ or
-;; https://www.reddit.com/r/emacs/comments/lfww57/weekly_tipstricketc_thread/)
+;; https://old.reddit.com/r/emacs/comments/lfww57/weekly_tipstricketc_thread/)
 ;; and show it.
 ;;
 ;; * Remarks
@@ -83,11 +83,11 @@
       (json-read))))
 
 (defconst reddigg--sub-url
-  "https://www.reddit.com/r/%s.json?count=25"
+  "https://old.reddit.com/r/%s.json?count=25"
   "Sub reddit template.")
 
 (defconst reddigg--cmt-url
-  "https://www.reddit.com/%s.json"
+  "https://old.reddit.com/%s.json"
   "Comment link template.")
 
 (defconst reddigg--cmt-more-url
@@ -282,7 +282,7 @@ Return a value of `reddigg--cmt-list-id'"
   (when (string-prefix-p "https" cmt)
     (setq cmt
           (substring cmt
-                     (length "https://www.reddit.com/") nil)))
+                     (length "https://old.reddit.com/") nil)))
   (reddigg--view-comments cmt))
 
 (defun reddigg--view-comments (cmt &optional new-window)
