@@ -90,3 +90,14 @@ https://github.com/thanhvg/emacs-reddigg/issues/5
 
 requests www.reddit.com will get react app
 must use old.reddit.com
+* TODO impletment sort feature
+** requests                                                           :verb:
+** get
+GET https://old.reddit.com/r/emacs.json?sort=top&t=week
+** search
+GET https://old.reddit.com/subreddits/search.json?q=remacs
+** get sort by top for a week
+GET https://old.reddit.com/r/emacs/top.json?sort=top&t=week
+
+* TODO minor mode
+
