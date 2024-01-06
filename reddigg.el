@@ -102,10 +102,13 @@
   "https://api.reddit.com/api/morechildren?api_type=json&link_id=%s&children=%s"
   "More comment link template.")
 
-(defvar reddigg--template-sub "[[elisp:(reddigg-view-sub \"%s\")][%s]]\n"
+(defconst reddigg--template-sub "[[elisp:(reddigg-view-sub \"%s\")][%s]]\n"
   "Template string for main.")
 
-(defvar reddigg--template-sub-sort "[[elisp:(reddigg--view-sub \"%s\" %s)][%s]]"
+(defconst reddigg--template-sub* "[[elisp:(reddigg-view-sub \"%s\")][%s]]"
+  "Template string for refresh sub post list.")
+
+(defconst reddigg--template-sub-sort "[[elisp:(reddigg--view-sub \"%s\" %s)][%s]]"
   "Template string for sub sort.")
 
 (defun reddigg--ensure-modes ()
@@ -208,7 +211,8 @@ after deleting the current line which should be the More button."
         (insert (format "#+title: Posts sorted by %s%s\n" (if sort sort 'default)
                         (if scope (format " %s" scope)
                           "")))
-        (insert (format reddigg--template-sub sub "refresh"))
+        (insert (format reddigg--template-sub* sub "refresh"))
+        (insert " ")
         (insert (format reddigg--template-sub-sort
                         sub
                         ":sort 'new"
@@ -259,27 +263,27 @@ after deleting the current line which should be the More button."
         (insert (format reddigg--template-sub-sort
                         sub
                         ":sort 'controversial :scope 'day"
-                        "controversial-day"))
+                        "con-day"))
         (insert " ")
         (insert (format reddigg--template-sub-sort
                         sub
                         ":sort 'controversial :scope 'week"
-                        "controversial-week"))
+                        "con-week"))
         (insert " ")
         (insert (format reddigg--template-sub-sort
                         sub
                         ":sort 'controversial :scope 'month"
-                        "controversial-month"))
+                        "con-month"))
         (insert " ")
         (insert (format reddigg--template-sub-sort
                         sub
                         ":sort 'controversial :scope 'year"
-                        "controversial-year"))
+                        "con-year"))
         (insert " ")
         (insert (format reddigg--template-sub-sort
                         sub
                         ":sort 'controversial :scope 'all"
-                        "controversial-all"))
+                        "con-all"))
         (insert "\n"))
 
       (seq-do
