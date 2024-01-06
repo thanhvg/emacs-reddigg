@@ -90,7 +90,7 @@ https://github.com/thanhvg/emacs-reddigg/issues/5
 
 requests www.reddit.com will get react app
 must use old.reddit.com
-* TODO impletment sort feature
+* DONE impletment sort feature
 must has user agent
 #+begin_src elisp
 (setq verb-base-headers '(("User-Agent" . "my-user-agent")))

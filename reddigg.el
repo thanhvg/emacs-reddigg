@@ -5,7 +5,7 @@
 ;; Author: Thanh Vuong <thanhvg@gmail.com>
 ;; URL: https://github.com/thanhvg/emacs-reddigg
 ;; Package-Requires: ((emacs "26.3") (promise "1.1") (ht "2.3") (request "0.3.0") (org "9.2"))
-;; Version: 0.4.0
+;; Version: 0.5.0
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
