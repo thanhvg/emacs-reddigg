@@ -91,13 +91,44 @@ https://github.com/thanhvg/emacs-reddigg/issues/5
 requests www.reddit.com will get react app
 must use old.reddit.com
 * TODO impletment sort feature
+must has user agent
+#+begin_src elisp
+(setq verb-base-headers '(("User-Agent" . "my-user-agent")))
+#+end_src
+
+#+RESULTS:
+: ((User-Agent . my-user-agent))
+
 ** requests                                                           :verb:
-** get
+*** get, won't sort
 GET https://old.reddit.com/r/emacs.json?sort=top&t=week
-** search
+*** search
 GET https://old.reddit.com/subreddits/search.json?q=remacs
-** get sort by top for a week
+*** get sort by top for a week
 GET https://old.reddit.com/r/emacs/top.json?sort=top&t=week
 
-* TODO minor mode
+*** get  new 
+GET https://old.reddit.com/r/emacs/new.json
 
+
+*** get  rising 
+GET https://old.reddit.com/r/emacs/rising.json
+*** controversial year day month week all
+GET https://old.reddit.com/r/emacs/controversial.json?sort=controversial&t=year
+
+** design
+place on top of =*reddigg*= buffer
+
+[[elisp:(reddigg-view-sub "emacs")][refresh]]
+best  new  [rising]
+top-hour  top-day  top-week  top-year  top-all-time
+controversial-hour  controversial-day  controversial-week  controversial-year  controversial-all-time  
+
+elisp:(reddigg-view-sub "emacs")
+
+
+[[elisp:(reddigg--view-sub-more "emacs" "t3_18xyq3z")][More]] elisp:(reddigg--view-sub-more "emacs" "t3_18xyq3z")
+
+elisp:(reddigg--view-sub "experienceddevs" :sort 'top :scope 'year)
+
+* TODO minor mode

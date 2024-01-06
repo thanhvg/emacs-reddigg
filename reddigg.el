@@ -86,6 +86,14 @@
   "https://old.reddit.com/r/%s.json?count=25"
   "Sub reddit template.")
 
+(defconst reddigg--sub-view-sort-url
+  "https://old.reddit.com/r/%s/%s.json?count=25"
+  "Sub reddit template for new and rising.")
+
+(defconst reddigg--sub-view-sort-scope-url
+  "https://old.reddit.com/r/%s/%s.json?count=25&sort=%s&t=%s"
+  "Sub reddit template for top and controversial.")
+
 (defconst reddigg--cmt-url
   "https://old.reddit.com/%s.json"
   "Comment link template.")
@@ -96,6 +104,9 @@
 
 (defvar reddigg--template-sub "[[elisp:(reddigg-view-sub \"%s\")][%s]]\n"
   "Template string for main.")
+
+(defvar reddigg--template-sub-sort "[[elisp:(reddigg--view-sub \"%s\" %s)][%s]]"
+  "Template string for sub sort.")
 
 (defun reddigg--ensure-modes ()
   "Get a bunch of modes up and running."
@@ -117,11 +128,23 @@
 (defvar-local reddigg--cmt-list-id nil
   "ID/name of the current comment list.")
 
-(cl-defun reddigg--promise-posts (sub &key after before)
-  "Promise SUB post list with keyword AFTER and BEFORE."
+(cl-defun reddigg--promise-posts (sub &key after before sort scope)
+  "Promise SUB post list with keywords.
+AFTER: fetch post after name.
+BEFORE: fetch posts before name.
+SORT: top, hot, best, rising, controversial.
+SCOPE: hour, day, week, year, all."
   (reddigg--promise-json
+   ;; create the url
    (concat
-    (format reddigg--sub-url sub)
+    (cond
+     ((or (eq sort 'new )
+          (eq sort 'rising))
+      (format reddigg--sub-view-sort-url sub sort))
+     ((or (eq sort 'top )
+          (eq sort 'controversial))
+      (format reddigg--sub-view-sort-scope-url sub sort sort scope))
+     (t (format reddigg--sub-url sub sort sort)))
     (when after
       (concat "&after=" after))
     (when before
@@ -171,7 +194,7 @@
   "Get main buffer."
   (get-buffer-create reddigg--main-buffer))
 
-(defun reddigg--print-sub (data sub &optional append)
+(cl-defun reddigg--print-sub (data sub &optional append &key sort scope)
   "Print sub post list in DATA for SUB.
 When APPEND is non-nil, will not delete buffer but append to it,
 after deleting the current line which should be the More button."
@@ -180,9 +203,84 @@ after deleting the current line which should be the More button."
       (if append
           (kill-whole-line)
         (erase-buffer)
+        ;; insert header and links
         (insert "#+startup: overview indent\n")
-        (insert "#+title: posts\n")
-        (insert (format reddigg--template-sub sub "refresh")))
+        (insert (format "#+title: Posts sorted by %s%s\n" (if sort sort 'default)
+                        (if scope (format " %s" scope)
+                          "")))
+        (insert (format reddigg--template-sub sub "refresh"))
+        (insert (format reddigg--template-sub-sort
+                        sub
+                        ":sort 'new"
+                        "new"))
+        (insert " ")
+        (insert (format reddigg--template-sub-sort
+                        sub
+                        ":sort 'rising"
+                        "rising"))
+        (insert "\n")
+        ;; top
+        (insert (format reddigg--template-sub-sort
+                        sub
+                        ":sort 'top :scope 'hour"
+                        "top-hour"))
+        (insert " ")
+        (insert (format reddigg--template-sub-sort
+                        sub
+                        ":sort 'top :scope 'day"
+                        "top-day"))
+        (insert " ")
+        (insert (format reddigg--template-sub-sort
+                        sub
+                        ":sort 'top :scope 'week"
+                        "top-week"))
+        (insert " ")
+        (insert (format reddigg--template-sub-sort
+                        sub
+                        ":sort 'top :scope 'month"
+                        "top-month"))
+        (insert " ")
+        (insert (format reddigg--template-sub-sort
+                        sub
+                        ":sort 'top :scope 'year"
+                        "top-year"))
+        (insert " ")
+        (insert (format reddigg--template-sub-sort
+                        sub
+                        ":sort 'top :scope 'all"
+                        "top-all"))
+        (insert "\n")
+        ;; controversial
+        (insert (format reddigg--template-sub-sort
+                        sub
+                        ":sort 'controversial :scope 'hour"
+                        "controversial-hour"))
+        (insert " ")
+        (insert (format reddigg--template-sub-sort
+                        sub
+                        ":sort 'controversial :scope 'day"
+                        "controversial-day"))
+        (insert " ")
+        (insert (format reddigg--template-sub-sort
+                        sub
+                        ":sort 'controversial :scope 'week"
+                        "controversial-week"))
+        (insert " ")
+        (insert (format reddigg--template-sub-sort
+                        sub
+                        ":sort 'controversial :scope 'month"
+                        "controversial-month"))
+        (insert " ")
+        (insert (format reddigg--template-sub-sort
+                        sub
+                        ":sort 'controversial :scope 'year"
+                        "controversial-year"))
+        (insert " ")
+        (insert (format reddigg--template-sub-sort
+                        sub
+                        ":sort 'controversial :scope 'all"
+                        "controversial-all"))
+        (insert "\n"))
 
       (seq-do
        (lambda (it)
@@ -204,7 +302,8 @@ after deleting the current line which should be the More button."
        (ht-get data "children"))
       (let ((after (ht-get data "after")))
         (when after
-          (insert (format "* [[elisp:(reddigg--view-sub-more \"%s\" \"%s\")][More]]" sub after))))
+          (insert (format "* [[elisp:(reddigg--view-sub-more \"%s\" \"%s\" '%s '%s)][More]]"
+                          sub after sort scope))))
       (reddigg--ensure-modes))))
 
 (defun reddigg--sanitize-range (begin end)
@@ -300,16 +399,25 @@ Return a value of `reddigg--cmt-list-id'"
                      (message "catch error in promise: %s" reason)))))
 
 
-(cl-defun reddigg--view-sub (sub &key after before append)
+(cl-defun reddigg--view-sub (sub &key after before append sort scope)
   "Fetch SUB and print its post list.
 AFTER: fetch post after name.
-BEFORE: fetch posts before name
-APPEND: tell `reddigg--print-sub' to append."
-  (promise-chain (reddigg--promise-posts sub :after after :before before)
+BEFORE: fetch posts before name.
+APPEND: tell `reddigg--print-sub' to append.
+SORT: top, hot, best, rising, controversial.
+SCOPE: hour, day, week, year, all."
+  (promise-chain (reddigg--promise-posts sub
+                                         :after after
+                                         :before before
+                                         :sort sort
+                                         :scope scope)
     (then (lambda (result)
             (ht-get result "data")))
     (then (lambda (data)
-            (reddigg--print-sub data sub append)))
+            (reddigg--print-sub data sub append
+                                :sort sort
+                                :scope scope
+                                )))
     (then (lambda (&rest _)
             (switch-to-buffer (reddigg--get-buffer))))
     (promise-catch (lambda (reason)
@@ -339,9 +447,9 @@ APPEND: tell `reddigg--print-sub' to append."
   (interactive)
   (reddigg--view-sub (mapconcat #'symbol-name reddigg-subs "+")))
 
-(defun reddigg--view-sub-more (sub after)
+(defun reddigg--view-sub-more (sub after sort scope)
   "Fetch SUB from AFTER and appen."
-  (reddigg--view-sub sub :after after :append t))
+  (reddigg--view-sub sub :after after :append t :sort sort :scope scope))
 
 ;;;###autoload
 (defun reddigg-view-main ()
