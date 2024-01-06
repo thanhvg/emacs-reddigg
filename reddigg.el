@@ -442,7 +442,7 @@ SCOPE: hour, day, week, year, all."
 ;;;###autoload
 (defun reddigg-view-sub (sub)
   "Prompt SUB and print its post list."
-  (interactive "sSubreddit: ")
+  (interactive (list (completing-read "Bash history: " reddigg-subs)))
   (reddigg--view-sub sub))
 
 ;;;###autoload
