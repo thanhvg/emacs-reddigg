@@ -289,10 +289,11 @@ after deleting the current line which should be the More button."
       (seq-do
        (lambda (it)
          (let ((my-it (gethash "data" it)))
-           (insert "* " (format-time-string "%Y-%m-%d" (gethash "created_utc" my-it)) " :: " (gethash "title" my-it) "\n")
+           (insert "* " (gethash "title" my-it) "\n")
            (insert "| " (ht-get my-it "subreddit_name_prefixed") " | ")
            (insert "score: " (format "%s" (gethash "score" my-it) ) " | ")
-           (insert "comments: " (format "%s" (gethash "num_comments" my-it)) " |\n")
+           (insert "comments: " (format "%s" (gethash "num_comments" my-it)) " | ")
+           (insert "created: " (format-time-string "%Y-%m-%d" (gethash "created_utc" my-it)) "\n") 
            (let ((selftext (gethash "selftext" my-it)) begin end)
              (if (string-empty-p selftext)
                  (insert (format "%s \n[[eww:%s][view in eww]]\n"
