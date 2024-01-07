@@ -208,8 +208,13 @@ after deleting the current line which should be the More button."
         (erase-buffer)
         ;; insert header and links
         (insert "#+startup: overview indent\n")
-        (insert (format "#+title: Posts sorted by %s%s\n" (if sort sort 'default)
-                        (if scope (format " %s" scope)
+        (insert (format "#+title: %s sorted by %s%s\n"
+                        (if (< (length sub) 30)
+                            sub
+                          "posts")
+                        (if sort sort 'default)
+                        (if scope
+                            (format " %s" scope)
                           "")))
         (insert (format reddigg--template-sub* sub "refresh"))
         (insert " ")
