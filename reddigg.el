@@ -4,8 +4,8 @@
 
 ;; Author: Thanh Vuong <thanhvg@gmail.com>
 ;; URL: https://github.com/thanhvg/emacs-reddigg
-;; Package-Requires: ((emacs "26.3") (promise "1.1") (ht "2.3") (request "0.3.0") (org "9.2"))
-;; Version: 0.5.0
+;; Package-Requires: ((emacs "26.3") (promise "1.1") (ht "2.3") (org "9.2"))
+;; Version: 0.6.0
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -53,7 +53,7 @@
 ;;; Code:
 
 (require 'promise)
-(require 'request)
+(require 'url)
 (require 'cl-lib)
 (require 'ht)
 (require 'org)
@@ -124,7 +124,7 @@
     ("&gt;" . ">")
     ("&lt;" . "<")
     ("&amp;#x200B;" . "\n")
-    ("&amp;nbsp;" . "\n") 
+    ("&amp;nbsp;" . "\n")
     ("&amp;" . "&"))
   "List of (find . replace) to sanitize the text in range.")
 
@@ -167,14 +167,17 @@ SCOPE: hour, day, week, year, all."
   "Promise a json from URL."
   (promise-new
    (lambda (resolve reject)
-     (request (url-encode-url url)
-       :headers `(("User-Agent" . "emacs"))
-       :parser 'reddigg--parse-json-buffer
-       ;; :parser 'json-read
-       :error (cl-function (lambda (&rest args &key error-thrown &allow-other-keys)
-                             (funcall reject  error-thrown)))
-       :success (cl-function (lambda (&key data &allow-other-keys)
-                               (funcall resolve data)))))))
+     (url-retrieve (url-encode-url url)
+                   (lambda (status)
+                     (if (plist-get status :error)
+                         (funcall reject (plist-get status :error))
+                       (condition-case ex
+                           (with-current-buffer (current-buffer)
+                             (if (not (url-http-parse-headers))
+                                 (funcall reject (buffer-string))
+                               (goto-char url-http-end-of-headers)  ; Move to the end of headers
+                               (funcall resolve (reddigg--parse-json-buffer))))
+                         (error (funcall reject ex)))))))))
 
 (defvar reddigg--main-buffer "*reddigg-main*"
   "Buffer for main page.")
@@ -298,7 +301,7 @@ after deleting the current line which should be the More button."
            (insert "| " (ht-get my-it "subreddit_name_prefixed") " | ")
            (insert "score: " (format "%s" (gethash "score" my-it) ) " | ")
            (insert "comments: " (format "%s" (gethash "num_comments" my-it)) " | ")
-           (insert "created: " (format-time-string "%Y-%m-%d" (gethash "created_utc" my-it)) "\n") 
+           (insert "created: " (format-time-string "%Y-%m-%d" (gethash "created_utc" my-it)) "\n")
            (let ((selftext (gethash "selftext" my-it)) begin end)
              (if (string-empty-p selftext)
                  (insert (format "%s \n[[eww:%s][view in eww]]\n"
@@ -338,9 +341,9 @@ after deleting the current line which should be the More button."
            ;; (insert level " reddigg: too many subcomments\n")
            (insert my-level
                    (format " [[elisp:(reddigg--view-more-cmts \"%s\" \"%s\")][load more comments (%s)]]\n"
-                          level
-                          (mapconcat #'identity (ht-get data "children") ",")
-                          (ht-get data "count")))
+                           level
+                           (mapconcat #'identity (ht-get data "children") ",")
+                           (ht-get data "count")))
 
          (insert my-level " " (ht-get data "author") "\n")
          (setq begin (point))
@@ -378,11 +381,11 @@ Return a value of `reddigg--cmt-list-id'"
     (insert (format "#+title: comments for '%s'\n"
                     (ht-get* (aref (ht-get* (aref data 0) "data" "children") 0) "data" "title")))
     (let ((post-id (reddigg--print-comment-1 (aref data 0))))
-     (reddigg--print-comment-2 (aref data 1) "*")
-     (reddigg--ensure-modes)
-     ;; must set here after org-mode is in otherwise when org-mode kicks in all
-     ;; local variables will be killed
-     (setq reddigg--cmt-list-id post-id))))
+      (reddigg--print-comment-2 (aref data 1) "*")
+      (reddigg--ensure-modes)
+      ;; must set here after org-mode is in otherwise when org-mode kicks in all
+      ;; local variables will be killed
+      (setq reddigg--cmt-list-id post-id))))
 
 ;;;###autoload
 (defun reddigg-view-comments (cmt)
