@@ -202,6 +202,8 @@ SCOPE: hour, day, week, year, all."
 
 (cl-defun reddigg--print-sub (data sub &optional append &key sort scope)
   "Print sub post list in DATA for SUB.
+SORT: top, hot, best, rising, controversial.
+SCOPE: hour, day, week, year, all.
 When APPEND is non-nil, will not delete buffer but append to it,
 after deleting the current line which should be the More button."
   (with-current-buffer (reddigg--get-buffer)
@@ -429,8 +431,7 @@ SCOPE: hour, day, week, year, all."
     (then (lambda (data)
             (reddigg--print-sub data sub append
                                 :sort sort
-                                :scope scope
-                                )))
+                                :scope scope)))
     (then (lambda (&rest _)
             (switch-to-buffer (reddigg--get-buffer))))
     (promise-catch (lambda (reason)
@@ -461,7 +462,7 @@ SCOPE: hour, day, week, year, all."
   (reddigg--view-sub (mapconcat #'symbol-name reddigg-subs "+")))
 
 (defun reddigg--view-sub-more (sub after sort scope)
-  "Fetch SUB from AFTER and appen."
+  "Fetch SUB from AFTER and append."
   (reddigg--view-sub sub :after after :append t :sort sort :scope scope))
 
 ;;;###autoload
