@@ -117,7 +117,8 @@
       (org-set-startup-visibility)
     (org-mode)
     (font-lock-flush))
-  (visual-line-mode))
+  (visual-line-mode)
+  (read-only-mode 1))
 
 (defvar reddigg-replacement-list
   '(("^\\* " . "- ")
