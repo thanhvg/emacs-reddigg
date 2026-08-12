@@ -5,7 +5,7 @@
 ;; Author: Thanh Vuong <thanhvg@gmail.com>
 ;; URL: https://github.com/thanhvg/emacs-reddigg
 ;; Package-Requires: ((emacs "26.3") (promise "1.1") (ht "2.3") (org "9.2"))
-;; Version: 0.6.0
+;; Version: 0.7.0
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -23,6 +23,27 @@
 ;;; Commentary:
 ;; This package allows you to browse reddit in org-mode.
 ;;
+;; * OAuth setup (required as of 0.7.0)
+;; Reddit's unauthenticated old.reddit.com/*.json endpoints are no longer a
+;; reliable free option, so this package now talks to oauth.reddit.com using
+;; an app-only ("client_credentials") OAuth2 token. This is still free and
+;; does not require your reddit username/password, since reddigg only ever
+;; reads public data.
+;;
+;; To set it up:
+;; 1. Go to https://www.reddit.com/prefs/apps and click "create app" /
+;;    "create another app".
+;; 2. Choose type "script". Redirect URI can be anything, e.g.
+;;    http://localhost:8080 -- it is not actually used by this flow.
+;; 3. After creating it you'll see a client ID (short string under the app
+;;    name) and a "secret" field.
+;; 4. Set `reddigg-client-id' and `reddigg-client-secret' accordingly, e.g.
+;;    via customize, or better, via auth-source (~/.authinfo.gpg):
+;;      machine reddigg.el login <client-id> password <client-secret>
+;;    and let `reddigg--auth-from-auth-source' pick it up automatically.
+;; 5. Set `reddigg-user-agent' to something unique identifying you, per
+;;    Reddit's API rules, e.g. "emacs:reddigg:0.7.0 (by /u/yourname)".
+;;
 ;; Buffers:
 ;; There are three buffers which are on org-mode. They show links and elisp
 ;; commands which will run when you enter/click (org-open-at-point) on them.
@@ -32,6 +53,9 @@
 ;;
 ;; Variables:
 ;; reddigg-subs: list of subreddits you want to show on *reddigg-main*
+;; reddigg-client-id: OAuth client id from your reddit "script" app
+;; reddigg-client-secret: OAuth client secret from your reddit "script" app
+;; reddigg-user-agent: a unique user agent string, required by reddit
 ;;
 ;; * Commands
 ;; reddigg-view-main: show your subreddit list in *reddigg-main*, r/all and
@@ -59,6 +83,7 @@
 (require 'org)
 (require 'json)
 (require 'url-util)
+(require 'auth-source)
 
 (defgroup reddigg nil
   "Search and read stackoverflow and sisters's sites."
@@ -69,6 +94,40 @@
   "List of subreddits."
   :type 'list
   :group 'reddigg)
+
+(defcustom reddigg-client-id nil
+  "Client id of your reddit \"script\" app.
+Create one at https://www.reddit.com/prefs/apps.
+Prefer setting this via auth-source instead of customize/plain text."
+  :type '(choice (const nil) string)
+  :group 'reddigg)
+
+(defcustom reddigg-client-secret nil
+  "Client secret of your reddit \"script\" app.
+Prefer setting this via auth-source instead of customize/plain text."
+  :type '(choice (const nil) string)
+  :group 'reddigg)
+
+(defcustom reddigg-user-agent "emacs:reddigg:0.7.0 (by /u/unknown)"
+  "User agent string sent with every request.
+Reddit requires a unique, descriptive user agent; requests with a
+generic or missing one are aggressively rate limited.  Recommended
+form: \"platform:app-id:version (by /u/your-username)\"."
+  :type 'string
+  :group 'reddigg)
+
+(defcustom reddigg-auth-source-host "reddigg.el"
+  "Host key to look up client id/secret in auth-source.
+Add a line like the following to ~/.authinfo(.gpg):
+  machine reddigg.el login YOUR_CLIENT_ID password YOUR_CLIENT_SECRET"
+  :type 'string
+  :group 'reddigg)
+
+(defvar reddigg--token nil
+  "Cached OAuth2 access token.")
+
+(defvar reddigg--token-expiry 0
+  "Float-time at which `reddigg--token' expires.")
 
 (defun reddigg--parse-json-buffer ()
   "Read json from buffer."
@@ -82,24 +141,28 @@
           (json-false nil))
       (json-read))))
 
+(defconst reddigg--token-url
+  "https://www.reddit.com/api/v1/access_token"
+  "OAuth2 token endpoint.")
+
 (defconst reddigg--sub-url
-  "https://old.reddit.com/r/%s.json?count=25"
+  "https://oauth.reddit.com/r/%s?count=25&raw_json=1"
   "Sub reddit template.")
 
 (defconst reddigg--sub-view-sort-url
-  "https://old.reddit.com/r/%s/%s.json?count=25"
+  "https://oauth.reddit.com/r/%s/%s?count=25&raw_json=1"
   "Sub reddit template for new and rising.")
 
 (defconst reddigg--sub-view-sort-scope-url
-  "https://old.reddit.com/r/%s/%s.json?count=25&sort=%s&t=%s"
+  "https://oauth.reddit.com/r/%s/%s?count=25&raw_json=1&sort=%s&t=%s"
   "Sub reddit template for top and controversial.")
 
 (defconst reddigg--cmt-url
-  "https://old.reddit.com/%s.json"
+  "https://oauth.reddit.com/%s?raw_json=1"
   "Comment link template.")
 
 (defconst reddigg--cmt-more-url
-  "https://api.reddit.com/api/morechildren?api_type=json&link_id=%s&children=%s"
+  "https://oauth.reddit.com/api/morechildren?api_type=json&raw_json=1&link_id=%s&children=%s"
   "More comment link template.")
 
 (defconst reddigg--template-sub "[[elisp:(reddigg-view-sub \"%s\")][%s]]\n"
@@ -126,10 +189,88 @@
     ("&amp;#x200B;" . "\n")
     ("&amp;nbsp;" . "\n")
     ("&amp;" . "&"))
-  "List of (find . replace) to sanitize the text in range.")
+  "List of (find . replace) to sanitize the text in range.
+With raw_json=1 (used by the OAuth API) reddit no longer double-escapes
+entities, but this is kept for safety and for the heading-clash fix.")
 
 (defvar-local reddigg--cmt-list-id nil
   "ID/name of the current comment list.")
+
+
+;;; OAuth2 token handling
+
+(defun reddigg--auth-from-auth-source ()
+  "Return (client-id . client-secret) from auth-source, or nil.
+Looks up `reddigg-auth-source-host' as the host/machine."
+  (let ((found (car (auth-source-search :host reddigg-auth-source-host
+                                        :require '(:user :secret)
+                                        :max 1))))
+    (when found
+      (cons (plist-get found :user)
+            (let ((secret (plist-get found :secret)))
+              (if (functionp secret) (funcall secret) secret))))))
+
+(defun reddigg--client-id-secret ()
+  "Resolve (client-id . client-secret) from customize vars or auth-source."
+  (if (and reddigg-client-id reddigg-client-secret)
+      (cons reddigg-client-id reddigg-client-secret)
+    (or (reddigg--auth-from-auth-source)
+        (user-error
+         "reddigg: set `reddigg-client-id'/`reddigg-client-secret', or add a %S entry to auth-source. See reddigg.el commentary for setup instructions"
+         reddigg-auth-source-host))))
+
+(defun reddigg--fetch-token ()
+  "Fetch a fresh app-only OAuth2 token, cache it, and return a promise of it."
+  (promise-new
+   (lambda (resolve reject)
+     (let* ((cred (reddigg--client-id-secret))
+            (client-id (car cred))
+            (client-secret (cdr cred))
+            (url-request-method "POST")
+            (url-request-extra-headers
+             `(("Authorization" . ,(concat "Basic "
+                    (base64-encode-string
+                     (concat client-id ":" client-secret) t)))
+               ("Content-Type" . "application/x-www-form-urlencoded")
+               ("User-Agent" . ,reddigg-user-agent)))
+            (url-request-data "grant_type=client_credentials"))
+       (url-retrieve
+        reddigg--token-url
+        (lambda (status)
+          (if (plist-get status :error)
+              (funcall reject (plist-get status :error))
+            (condition-case ex
+                (with-current-buffer (current-buffer)
+                  (if (not (url-http-parse-headers))
+                      (funcall reject (buffer-string))
+                    (goto-char url-http-end-of-headers)
+                    (let* ((json (reddigg--parse-json-buffer))
+                           (token (gethash "access_token" json))
+                           (expires (gethash "expires_in" json))
+                           (err (gethash "error" json)))
+                      (cond
+                       (err (funcall reject (format "reddit oauth error: %s" err)))
+                       ((not token) (funcall reject "reddigg: no access_token in response"))
+                       (t
+                        (setq reddigg--token token
+                              reddigg--token-expiry (+ (float-time) (or expires 3600)))
+                        (funcall resolve token))))))
+              (error (funcall reject ex)))))
+        nil t)))))
+
+(defun reddigg--ensure-token ()
+  "Return a promise resolving to a valid, non-expired access token."
+  (if (and reddigg--token (< (float-time) (- reddigg--token-expiry 30)))
+      (promise-resolve reddigg--token)
+    (reddigg--fetch-token)))
+
+(defun reddigg--invalidate-token ()
+  "Drop the cached token, forcing a refetch on next request."
+  (setq reddigg--token nil
+        reddigg--token-expiry 0))
+
+
+;;; HTTP / promise plumbing
 
 (cl-defun reddigg--promise-posts (sub &key after before sort scope)
   "Promise SUB post list with keywords.
@@ -163,21 +304,48 @@ SCOPE: hour, day, week, year, all."
                                  reddigg--cmt-list-id
                                  children)))
 
+(defun reddigg--promise-json-request (url)
+  "Perform a single authenticated GET to URL and promise the parsed JSON.
+Rejects with the symbol `reddigg--unauthorized' on a 401 response so
+the caller can refresh the token and retry."
+  (promise-then
+   (reddigg--ensure-token)
+   (lambda (token)
+     (promise-new
+      (lambda (resolve reject)
+        (let ((url-request-extra-headers
+               `(("Authorization" . ,(concat "Bearer " token))
+                 ("User-Agent" . ,reddigg-user-agent))))
+          (url-retrieve
+           (url-encode-url url)
+           (lambda (status)
+             (if (plist-get status :error)
+                 (funcall reject (plist-get status :error))
+               (condition-case ex
+                   (with-current-buffer (current-buffer)
+                     (let ((code (url-http-parse-headers)))
+                       (cond
+                        ((not code) (funcall reject (buffer-string)))
+                        ((eq url-http-response-status 401)
+                         (funcall reject 'reddigg--unauthorized))
+                        ((eq url-http-response-status 429)
+                         (funcall reject "reddigg: rate limited (429) by reddit, try again shortly"))
+                        (t
+                         (goto-char url-http-end-of-headers)
+                         (funcall resolve (reddigg--parse-json-buffer))))))
+                 (error (funcall reject ex)))))
+           nil t)))))))
+
 (defun reddigg--promise-json (url)
-  "Promise a json from URL."
-  (promise-new
-   (lambda (resolve reject)
-     (url-retrieve (url-encode-url url)
-                   (lambda (status)
-                     (if (plist-get status :error)
-                         (funcall reject (plist-get status :error))
-                       (condition-case ex
-                           (with-current-buffer (current-buffer)
-                             (if (not (url-http-parse-headers))
-                                 (funcall reject (buffer-string))
-                               (goto-char url-http-end-of-headers)  ; Move to the end of headers
-                               (funcall resolve (reddigg--parse-json-buffer))))
-                         (error (funcall reject ex)))))))))
+  "Promise a json from URL, transparently refreshing the token once on 401."
+  (promise-catch
+   (reddigg--promise-json-request url)
+   (lambda (reason)
+     (if (eq reason 'reddigg--unauthorized)
+         (progn
+           (reddigg--invalidate-token)
+           (reddigg--promise-json-request url))
+       (promise-new (lambda (_resolve reject) (funcall reject reason)))))))
 
 (defvar reddigg--main-buffer "*reddigg-main*"
   "Buffer for main page.")
