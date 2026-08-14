@@ -23,6 +23,21 @@
 ;;; Commentary:
 ;; This package allows you to browse reddit in org-mode.
 ;;
+;; Reddit now requires a logged-in, browser-driven session for its
+;; JSON endpoints, so reddigg no longer talks to old.reddit.com
+;; directly with `url-retrieve'.  Instead it uses the `browsel'
+;; package (https://github.com/dmgerman/browsel) to run the fetch
+;; *inside* an already-open, already-authenticated reddit tab in
+;; your real browser, and reads the resulting JSON text back into
+;; Emacs.  You must:
+;;   1. Have `browsel' set up and running (see its README) with both
+;;      the Emacs side (`browsel-start') and the browser extension
+;;      loaded and connected.
+;;   2. Be logged into old.reddit.com in that browser.
+;; reddigg will look for an already-open reddit tab; if it can't
+;; find one it will offer to open old.reddit.com for you and wait
+;; for it to finish loading before continuing.
+;;
 ;; Buffers:
 ;; There are three buffers which are on org-mode. They show links and elisp
 ;; commands which will run when you enter/click (org-open-at-point) on them.
@@ -53,12 +68,15 @@
 ;;; Code:
 
 (require 'promise)
-(require 'url)
 (require 'cl-lib)
+(require 'seq)
 (require 'ht)
 (require 'org)
 (require 'json)
-(require 'url-util)
+;; Soft-required: only needed once `reddigg-start' / a fetch actually
+;; runs, but we want a clear error message rather than a void-function
+;; error if it's missing.
+(require 'browsel nil t)
 
 (defgroup reddigg nil
   "Search and read stackoverflow and sisters's sites."
@@ -70,17 +88,45 @@
   :type 'list
   :group 'reddigg)
 
-(defun reddigg--parse-json-buffer ()
-  "Read json from buffer."
-  (if (fboundp 'json-parse-buffer)
-      (json-parse-buffer
-       :object-type 'hash-table
-       :null-object nil
-       :false-object nil)
+(defcustom reddigg-browsel-client nil
+  "Browser client name (\"chrome\" or \"firefox\") to address via browsel.
+Leave nil to let browsel pick automatically; only required when more
+than one browser is connected to Emacs at the same time."
+  :type '(choice (const :tag "Auto" nil) string)
+  :group 'reddigg)
+
+(defcustom reddigg-reddit-host-regexp "\\(?:old\\.\\)?reddit\\.com"
+  "Regexp matched against a tab's URL to recognise it as a reddit tab."
+  :type 'regexp
+  :group 'reddigg)
+
+(defcustom reddigg-reddit-open-url "https://old.reddit.com"
+  "URL to open when no reddit tab is found and the user agrees to open one."
+  :type 'string
+  :group 'reddigg)
+
+(defcustom reddigg-browsel-tab-wait-timeout 20
+  "Seconds to wait for a freshly opened reddit tab to finish loading."
+  :type 'number
+  :group 'reddigg)
+
+(defun reddigg--parse-json-string (text)
+  "Parse JSON TEXT the way reddit's API responses should be read:
+hash-tables for objects, nil for both JSON null and false."
+  (if (fboundp 'json-parse-string)
+      (json-parse-string text
+                          :object-type 'hash-table
+                          :null-object nil
+                          :false-object nil)
     (let ((json-array-type 'vector)
           (json-object-type 'hash-table)
           (json-false nil))
-      (json-read))))
+      (json-read-from-string text))))
+
+(defun reddigg--parse-json-buffer ()
+  "Read json from the current buffer (from point to the end)."
+  (reddigg--parse-json-string
+   (buffer-substring-no-properties (point) (point-max))))
 
 (defconst reddigg--sub-url
   "https://old.reddit.com/r/%s.json?count=25"
@@ -163,21 +209,135 @@ SCOPE: hour, day, week, year, all."
                                  reddigg--cmt-list-id
                                  children)))
 
+;;; --- JSON fetching via browsel ------------------------------------------
+;;
+;; Reddit's JSON endpoints now require a real, logged-in browser
+;; session, so all fetches go through `browsel', running inside an
+;; open reddit tab.
+
+(defun reddigg--browsel-plist-tab-p (x)
+  "Heuristic: does X look like a single tab plist (i.e. has an :id)?"
+  (and (consp x) (plist-member x :id)))
+
+(defun reddigg--browsel-as-tab-list (x)
+  "Coerce a browsel response X into a list of tab plists.
+
+The exact response envelope for GET_ALL_TABS / OPEN_TAB isn't
+pinned down from the README alone (it's shown both as a bare list
+of tabs and as a `:status'/`:result' plist), so this accepts
+either: a bare list, a vector, a single tab plist, or an envelope
+plist whose payload lives under :tabs, :result, or :tab."
+  (cond
+   ((null x) nil)
+   ((reddigg--browsel-plist-tab-p x) (list x))
+   ((vectorp x) (append x nil))
+   ((and (consp x) (plist-member x :status))
+    (reddigg--browsel-as-tab-list (or (plist-get x :tabs)
+                                       (plist-get x :result)
+                                       (plist-get x :tab))))
+   ((listp x) x)
+   (t nil)))
+
+(defun reddigg--ensure-browsel ()
+  "Signal a clear error if `browsel' isn't loaded."
+  (unless (featurep 'browsel)
+    (user-error "reddigg: `browsel' is not loaded; install it and \
+require it (or add it to your `use-package browsel' config) before \
+using reddigg")))
+
+(defun reddigg--find-reddit-tab-id ()
+  "Return the id of an already-open tab that looks like reddit, or nil."
+  (let* ((resp (browsel-request "GET_ALL_TABS" nil reddigg-browsel-client))
+         (tabs (reddigg--browsel-as-tab-list resp))
+         (tab (seq-find (lambda (tb)
+                          (string-match-p reddigg-reddit-host-regexp
+                                          (or (plist-get tb :url) "")))
+                        tabs)))
+    (plist-get tab :id)))
+
+(defun reddigg--tab-ready-p (id)
+  "Non-nil when tab ID exists, is done loading, and is on reddit."
+  (let* ((resp (browsel-request "GET_ALL_TABS" nil reddigg-browsel-client))
+         (tabs (reddigg--browsel-as-tab-list resp))
+         (tab (seq-find (lambda (tb) (equal (plist-get tb :id) id)) tabs)))
+    (and tab
+         (or (null (plist-get tab :status))
+             (equal (plist-get tab :status) "complete"))
+         (string-match-p reddigg-reddit-host-regexp (or (plist-get tab :url) "")))))
+
+(defun reddigg--wait-tab-ready (id)
+  "Block (with `sit-for') until tab ID is ready or we time out."
+  (let ((deadline (+ (float-time) reddigg-browsel-tab-wait-timeout)))
+    (while (and (< (float-time) deadline)
+                (not (reddigg--tab-ready-p id)))
+      (sit-for 0.5))
+    (unless (reddigg--tab-ready-p id)
+      (user-error "reddigg: timed out waiting for the reddit tab to finish loading"))))
+
+(defun reddigg--open-reddit-tab-and-wait ()
+  "Ask the user, then open `reddigg-reddit-open-url' and wait for it."
+  (unless (y-or-n-p (format "reddigg: no reddit tab found; open %s now? "
+                            reddigg-reddit-open-url))
+    (user-error "reddigg: open %s in your browser and retry"
+               reddigg-reddit-open-url))
+  (let* ((resp (browsel-request "OPEN_TAB" (list :url reddigg-reddit-open-url)
+                                reddigg-browsel-client))
+         (tab (car (reddigg--browsel-as-tab-list resp)))
+         (id (plist-get tab :id)))
+    (unless id
+      (user-error "reddigg: could not open a reddit tab (response: %S)" resp))
+    (reddigg--wait-tab-ready id)
+    id))
+
+(defun reddigg--reddit-tab-id (&optional prompt-if-missing)
+  "Return the id of a reddit tab, prompting to open one if PROMPT-IF-MISSING."
+  (or (reddigg--find-reddit-tab-id)
+      (when prompt-if-missing
+        (reddigg--open-reddit-tab-and-wait))))
+
+(defun reddigg--fetch-js (url)
+  "JS to run inside the reddit tab: same-origin fetch of URL (so it
+rides along with the tab's own cookies/session), returning the raw
+JSON response body as a string."
+  (let ((json-url (json-encode url)))
+    (format "(async () => {
+  const r = await fetch(%s, { credentials: 'include' });
+  if (!r.ok) throw new Error('reddigg: HTTP ' + r.status + ' for ' + %s);
+  return await r.text();
+})()"
+            json-url json-url)))
+
+(defun reddigg--handle-eval-response (response resolve reject)
+  "Unpack an EVAL_IN_ACTIVE_TAB RESPONSE and RESOLVE/REJECT accordingly."
+  (if (not (equal (plist-get response :status) "ok"))
+      (funcall reject (or (plist-get response :message) response))
+    (let* ((results (plist-get response :result))
+           (first (cond ((vectorp results) (aref results 0))
+                       ((consp results) (car results))
+                       (t results)))
+           (text (plist-get first :result)))
+      (if (not (stringp text))
+          (funcall reject (format "reddigg: unexpected eval result shape: %S" response))
+        (condition-case err
+            (funcall resolve (reddigg--parse-json-string text))
+          (error (funcall reject err)))))))
+
 (defun reddigg--promise-json (url)
-  "Promise a json from URL."
+  "Promise the JSON at URL, fetched from inside a live reddit tab via browsel."
+  (reddigg--ensure-browsel)
   (promise-new
    (lambda (resolve reject)
-     (url-retrieve (url-encode-url url)
-                   (lambda (status)
-                     (if (plist-get status :error)
-                         (funcall reject (plist-get status :error))
-                       (condition-case ex
-                           (with-current-buffer (current-buffer)
-                             (if (not (url-http-parse-headers))
-                                 (funcall reject (buffer-string))
-                               (goto-char url-http-end-of-headers)  ; Move to the end of headers
-                               (funcall resolve (reddigg--parse-json-buffer))))
-                         (error (funcall reject ex)))))))))
+     (condition-case err
+         (let ((tab-id (reddigg--reddit-tab-id t)))
+           (browsel-request-async
+            "EVAL_IN_ACTIVE_TAB"
+            (list :tabId tab-id :code (reddigg--fetch-js url))
+            (lambda (response)
+              (reddigg--handle-eval-response response resolve reject))
+            reddigg-browsel-client))
+       (error (funcall reject err))))))
+
+;;; --- rest of the package (unchanged) ------------------------------------
 
 (defvar reddigg--main-buffer "*reddigg-main*"
   "Buffer for main page.")
