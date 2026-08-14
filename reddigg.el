@@ -110,6 +110,12 @@ than one browser is connected to Emacs at the same time."
   :type 'number
   :group 'reddigg)
 
+(defvar reddigg--modhash nil
+  "Cached CSRF modhash scraped from the reddit tab.")
+
+(defvar reddigg--current-user nil
+  "Cached logged-in reddit username, scraped from the reddit tab.")
+
 (defun reddigg--parse-json-string (text)
   "Parse JSON TEXT the way reddit's API responses should be read:
 hash-tables for objects, nil for both JSON null and false."
@@ -322,20 +328,315 @@ JSON response body as a string."
             (funcall resolve (reddigg--parse-json-string text))
           (error (funcall reject err)))))))
 
-(defun reddigg--promise-json (url)
-  "Promise the JSON at URL, fetched from inside a live reddit tab via browsel."
+(defun reddigg--eval-json-promise (code &optional tab-id)
+  "Run JS CODE in a reddit tab (finding/opening one unless TAB-ID is
+given). CODE must return a JSON string. Promise the parsed JSON."
   (reddigg--ensure-browsel)
   (promise-new
    (lambda (resolve reject)
      (condition-case err
-         (let ((tab-id (reddigg--reddit-tab-id t)))
+         (let ((id (or tab-id (reddigg--reddit-tab-id t))))
            (browsel-request-async
             "EVAL_IN_ACTIVE_TAB"
-            (list :tabId tab-id :code (reddigg--fetch-js url))
+            (list :tabId id :code code)
             (lambda (response)
               (reddigg--handle-eval-response response resolve reject))
             reddigg-browsel-client))
        (error (funcall reject err))))))
+
+(defun reddigg--promise-json (url)
+  "Promise the JSON at URL, fetched from inside a live reddit tab via browsel."
+  (reddigg--eval-json-promise (reddigg--fetch-js url)))
+
+;;; --- CSRF / session info ------------------------------------------------
+;;
+;; Reddit's POST endpoints require a modhash: a CSRF token embedded
+;; in the page itself (window.r.config.modhash on old.reddit.com),
+;; alongside the session cookie the browser already attaches
+;; automatically. The cookie alone proves you're logged in; the
+;; modhash proves the request was actually issued by code running on
+;; reddit's own page (cross-origin script can't read it), which is
+;; what blocks a forged cross-site request. reddit's own "vote"
+;; button reads this same value before submitting -- we're just
+;; doing what it does.
+
+(defun reddigg--session-info-js ()
+  "JS returning {modhash, user} as a JSON string, scraped from the
+loaded reddit page. Tries the legacy `r.config' object first, falls
+back to scraping the DOM in case that object ever goes away."
+  "(() => {
+  let modhash = null, user = null;
+  try {
+    if (typeof r !== 'undefined' && r.config) {
+      modhash = r.config.modhash || null;
+      user = r.config.cur_user || null;
+    }
+  } catch (e) {}
+  if (!modhash) {
+    const el = document.querySelector('input[name=\"uh\"]');
+    if (el) modhash = el.value;
+  }
+  if (!user) {
+    const el = document.querySelector('.user a');
+    if (el) user = el.textContent.trim();
+  }
+  return JSON.stringify({ modhash: modhash, user: user });
+})()")
+
+(defun reddigg--promise-session-info (&optional force)
+  "Promise (MODHASH . USER). Uses cached values unless FORCE."
+  (if (and (not force) reddigg--modhash reddigg--current-user)
+      (promise-resolve (cons reddigg--modhash reddigg--current-user))
+    (promise-chain (reddigg--eval-json-promise (reddigg--session-info-js))
+      (then (lambda (data)
+              (let ((modhash (gethash "modhash" data))
+                    (user (gethash "user" data)))
+                (unless (and modhash (> (length modhash) 0))
+                  (error "reddigg: no CSRF modhash found on the reddit tab \
+(are you logged into old.reddit.com?)"))
+                (setq reddigg--modhash modhash
+                      reddigg--current-user user)
+                (cons modhash user)))))))
+
+;;;###autoload
+(defun reddigg-refresh-session ()
+  "Force re-reading the CSRF modhash and username from the reddit tab.
+Use this if actions start failing after you log out/in or switch
+accounts in the browser."
+  (interactive)
+  (promise-chain (reddigg--promise-session-info t)
+    (then (lambda (info)
+            (message "reddigg: session refreshed (logged in as %s)" (cdr info))))
+    (promise-catch (lambda (reason)
+                     (message "reddigg: could not refresh session: %s" reason)))))
+
+;;; --- Generic authenticated POST ------------------------------------------
+
+(defun reddigg--post-js (path fields)
+  "JS that POSTs FIELDS (an elisp alist) to PATH on the current
+origin, same-origin with credentials, and returns the response body
+as a string."
+  (format "(async () => {
+  const params = new URLSearchParams(%s);
+  const r = await fetch(%s, {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params.toString()
+  });
+  const text = await r.text();
+  if (!r.ok) throw new Error('reddigg: HTTP ' + r.status + ' for ' + %s + ': ' + text);
+  return text;
+})()"
+          (json-encode fields) (json-encode path) (json-encode path)))
+
+(defun reddigg--check-api-errors (data)
+  "Signal a readable error if DATA (parsed reddit API JSON) carries
+errors in the {\"json\":{\"errors\":[...]}} envelope; else return DATA."
+  (when (hash-table-p data)
+    (let* ((json (gethash "json" data))
+           (errors (and (hash-table-p json) (gethash "errors" json))))
+      (when (and errors (> (length errors) 0))
+        (error "reddigg: reddit API error: %s"
+               (mapconcat (lambda (e) (format "%s" (if (>= (length e) 2) (aref e 1) e)))
+                          (append errors nil) "; ")))))
+  data)
+
+(defun reddigg--promise-post (path fields)
+  "Promise the parsed JSON result of POSTing FIELDS to PATH (e.g.
+\"/api/vote\") on old.reddit.com, run from inside the reddit tab.
+Automatically attaches the CSRF modhash once session info is known,
+and signals an error if the API reports one."
+  (promise-chain (reddigg--promise-session-info)
+    (then (lambda (info)
+            (let ((full-fields (append fields
+                                        (list (cons "uh" (car info))
+                                              (cons "api_type" "json")))))
+              (reddigg--eval-json-promise (reddigg--post-js path full-fields)))))
+    (then #'reddigg--check-api-errors)))
+
+;;; --- Thing identity (posts/comments) at point ----------------------------
+
+(defun reddigg--thing-at-point ()
+  "Return (ID . AUTHOR) for the reddigg entry at point, or user-error."
+  (save-excursion
+    (condition-case nil
+        (org-back-to-heading t)
+      (error (user-error "reddigg: point is not on a reddigg entry")))
+    (let ((id (org-entry-get (point) "REDDIGG_ID"))
+          (author (org-entry-get (point) "REDDIGG_AUTHOR")))
+      (unless id
+        (user-error "reddigg: no reddit item at point (missing REDDIGG_ID)"))
+      (cons id author))))
+
+;;; --- Voting ---------------------------------------------------------------
+
+(defconst reddigg--vote-path "/api/vote")
+
+(defun reddigg--vote (dir)
+  "Vote DIR (1, -1, or 0) on the reddigg entry at point."
+  (let* ((thing (reddigg--thing-at-point))
+         (id (car thing))
+         (marker (point-marker)))
+    (promise-chain (reddigg--promise-post reddigg--vote-path
+                                          (list (cons "id" id) (cons "dir" dir)))
+      (then (lambda (_data)
+              (with-current-buffer (marker-buffer marker)
+                (save-excursion
+                  (goto-char marker)
+                  (org-back-to-heading t)
+                  (org-entry-put (point) "REDDIGG_LIKES"
+                                 (pcase dir (1 "up") (-1 "down") (_ "none")))
+                  (message "reddigg: %s"
+                          (pcase dir (1 "upvoted") (-1 "downvoted") (_ "vote cleared")))))))
+      (promise-catch (lambda (reason)
+                       (message "reddigg: vote failed: %s" reason))))))
+
+;;;###autoload
+(defun reddigg-vote-up ()
+  "Upvote the post or comment at point."
+  (interactive)
+  (reddigg--vote 1))
+
+;;;###autoload
+(defun reddigg-vote-down ()
+  "Downvote the post or comment at point."
+  (interactive)
+  (reddigg--vote -1))
+
+;;;###autoload
+(defun reddigg-vote-clear ()
+  "Clear your vote on the post or comment at point."
+  (interactive)
+  (reddigg--vote 0))
+
+;;; --- Compose buffers (reply/edit/submit) -----------------------------------
+
+(defvar-local reddigg-compose--kind nil
+  "Symbol: `comment', `edit', or `submit'. Decides what C-c C-c does.")
+(defvar-local reddigg-compose--parent-id nil
+  "Fullname of the thing being replied to (kind `comment').")
+(defvar-local reddigg-compose--target-marker nil
+  "Marker in the source buffer where the result should be inserted/updated.")
+(defvar-local reddigg-compose--extra-fields nil
+  "Alist of extra POST fields the specific kind needs (e.g. thing_id for edit).")
+
+(defvar reddigg-compose-mode-map
+  (let ((m (make-sparse-keymap)))
+    (define-key m (kbd "C-c C-c") #'reddigg-compose-send)
+    (define-key m (kbd "C-c C-k") #'reddigg-compose-abort)
+    m)
+  "Keymap for reddigg compose buffers.")
+
+(define-minor-mode reddigg-compose-mode
+  "Minor mode for composing reddit comments/posts/edits."
+  :lighter " reddigg-compose"
+  :keymap reddigg-compose-mode-map)
+
+(defun reddigg--compose-body ()
+  "Return the compose buffer's text, stripping leading `# reddigg:' lines."
+  (save-excursion
+    (goto-char (point-min))
+    (while (looking-at "^# reddigg:.*\n") (forward-line 1))
+    (string-trim (buffer-substring-no-properties (point) (point-max)))))
+
+(defun reddigg-compose-abort ()
+  "Abandon the current reddigg compose buffer."
+  (interactive)
+  (when (y-or-n-p "reddigg: discard this? ")
+    (kill-buffer)))
+
+(defun reddigg-compose-send ()
+  "Submit the current reddigg compose buffer, dispatching on its kind."
+  (interactive)
+  (let ((kind reddigg-compose--kind)
+        (body (reddigg--compose-body))
+        (buf (current-buffer)))
+    (when (string-empty-p body)
+      (user-error "reddigg: empty body, nothing to send"))
+    (pcase kind
+      ('comment (reddigg--send-comment buf body))
+      (_ (error "reddigg: compose kind %S not implemented yet" kind)))))
+
+(defun reddigg--insert-new-comment (parent-marker comment-data)
+  "Insert COMMENT-DATA (a hash-table from reddit's api/comment response)
+as a new child heading under PARENT-MARKER's entry."
+  (with-current-buffer (marker-buffer parent-marker)
+    (let ((inhibit-read-only t))
+      (save-excursion
+        (goto-char parent-marker)
+        (org-back-to-heading t)
+        (let ((level (org-current-level))
+              (author (gethash "author" comment-data))
+              (body (gethash "body" comment-data))
+              (name (gethash "name" comment-data)))
+          (org-end-of-subtree t t)
+          (unless (bolp) (insert "\n"))
+          (insert (make-string (1+ level) ?*) " " author "\n")
+          (insert ":PROPERTIES:\n")
+          (insert (format ":REDDIGG_ID: %s\n" name))
+          (insert (format ":REDDIGG_AUTHOR: %s\n" author))
+          (insert ":END:\n")
+          (insert body "\n"))))))
+
+(defconst reddigg--comment-path "/api/comment")
+
+(defun reddigg--send-comment (compose-buffer body)
+  (let ((parent-id (buffer-local-value 'reddigg-compose--parent-id compose-buffer))
+        (target-marker (buffer-local-value 'reddigg-compose--target-marker compose-buffer)))
+    (promise-chain (reddigg--promise-post reddigg--comment-path
+                                          (list (cons "thing_id" parent-id)
+                                                (cons "text" body)))
+      (then (lambda (data)
+              (let* ((json (gethash "json" data))
+                     (things (and json (gethash "data" json)
+                                  (gethash "things" (gethash "data" json))))
+                     (comment (and things (> (length things) 0)
+                                   (gethash "data" (aref things 0)))))
+                (if comment
+                    (reddigg--insert-new-comment target-marker comment)
+                  (message "reddigg: comment posted, but couldn't parse the \
+response; refresh to see it.")))
+              (when (buffer-live-p compose-buffer)
+                (kill-buffer compose-buffer))
+              (message "reddigg: reply posted")))
+      (promise-catch (lambda (reason)
+                       (message "reddigg: reply failed: %s" reason))))))
+
+;;;###autoload
+(defun reddigg-reply-at-point ()
+  "Compose a reply to the post or comment at point."
+  (interactive)
+  (let* ((thing (reddigg--thing-at-point))
+         (parent-id (car thing))
+         (parent-marker (point-marker))
+         (buf (generate-new-buffer "*reddigg-reply*")))
+    (with-current-buffer buf
+      (org-mode)
+      (reddigg-compose-mode 1)
+      (setq-local reddigg-compose--kind 'comment)
+      (setq-local reddigg-compose--parent-id parent-id)
+      (setq-local reddigg-compose--target-marker parent-marker)
+      (insert (format "# reddigg: replying to %s\n" parent-id))
+      (insert "# reddigg: C-c C-c to send, C-c C-k to abort\n\n"))
+    (pop-to-buffer buf)
+    (goto-char (point-max))))
+
+;;; --- View-buffer keymap (voting, replying) ---------------------------------
+
+(defvar reddigg-view-mode-map
+  (let ((m (make-sparse-keymap)))
+    (define-key m (kbd "C-c C-v u") #'reddigg-vote-up)
+    (define-key m (kbd "C-c C-v d") #'reddigg-vote-down)
+    (define-key m (kbd "C-c C-v 0") #'reddigg-vote-clear)
+    (define-key m (kbd "C-c C-v r") #'reddigg-reply-at-point)
+    m)
+  "Keymap for reddigg's generated browsing buffers.")
+
+(define-minor-mode reddigg-view-mode
+  "Minor mode for reddigg's generated org buffers (posts, comments)."
+  :lighter " reddigg"
+  :keymap reddigg-view-mode-map)
 
 ;;; --- rest of the package (unchanged) ------------------------------------
 
