@@ -1,61 +1,164 @@
 #+STARTUP: content indent
-#+title: View reddit in emacs org-mode
+#+title: View Reddit in Emacs org-mode
 
 [[http://spacemacs.org][file:https://cdn.rawgit.com/syl20bnr/spacemacs/442d025779da2f62fc86c2082703697714db6514/assets/spacemacs-badge.svg]]
-
 [[file:media/screenshot.png]]
-
-
 [[file:media/screencast.gif]]
 
 * Intro
-This package allows you to browse reddit in org-mode.
 
-* Warning
-As reddit no longer provides free APIs, this package may stop working in the near future.
+This package lets you browse Reddit in Emacs org-mode.
 
-* Install
-MELPA
+It also lets you vote, reply, edit, delete, and submit posts.
 
-[[https://melpa.org/#/reddigg][file:https://melpa.org/packages/reddigg-badge.svg]]
+Reddit requests now require a logged-in browser session for these actions.
 
-Spacemacs layer:
+~reddigg.el~ uses [[https://github.com/dmgerman/browsel][browsel]] to run Reddit requests inside your browser.
 
-https://github.com/thanhvg/spacemacs-eos
+* Requirements
+
+- Emacs 26.3 or later.
+- ~promise~ 1.1 or later.
+- ~ht~ 2.3 or later.
+- ~org~ 9.2 or later.
+- [[https://github.com/dmgerman/browsel][browsel]] with its Emacs package and browser extension.
+- A logged-in Reddit session in the browser.
+
+* Setup
+
+1. Install the required Emacs packages.
+2. Install and configure ~browsel~.
+3. Start the ~browsel~ Emacs client.
+4. Load the ~browsel~ browser extension.
+5. Log in to Reddit in that browser.
+6. Open a Reddit tab in that browser.
+7. Load ~reddigg.el~ in Emacs.
+
+If no Reddit tab exists, let ~reddigg~ open one when it asks.
 
 * Buffers
-There are three buffers which are on org-mode. They show links and elisp
-commands which will run when you enter/click (~org-open-at-point~) on them. By
-default org-mode will ask you for confirmation. You can disable it:
 
-#+begin_example elsip
-(setq org-confirm-elisp-link-function nil)
-#+end_example
+~*reddigg-main*~ shows your subreddit list.
 
-Or change it to ‘y-or-n-p’ if you want to confirm with a single keystroke rather
-than having to type "yes".
+~*reddigg*~ shows posts from a subreddit.
 
-~*reddigg-main*~: show your subreddit list, enter on them will fetch the
-subreddit posts and show them on ~*reddigg*~. On ~*reddigg*~ when you enter on a
-post will fetch the comments and show them on ~*reddigg-comments*~ buffer.
-  
+~*reddigg-comments*~ shows comments for a post.
+
+The buffers use org-mode.
+
+Enter on a Reddit link to run its Emacs command.
+
 * Variables
-~reddigg-subs~: list of subreddits you want to show on ~*reddigg-main*~
+
+~reddigg-subs~ lists the subreddits for ~*reddigg-main*~.
+
+~reddigg-browsel-client~ selects a browser client when more than one client connects.
+
+Set it to ~nil~ for automatic client selection.
+
+~reddigg-reddit-host-regexp~ identifies Reddit tabs by their URL.
+
+~reddigg-reddit-open-url~ sets the URL that ~reddigg~ opens when no Reddit tab exists.
+
+~reddigg-browsel-tab-wait-timeout~ sets the wait time for a new Reddit tab.
+
 * Commands
-~reddigg-view-main~: show your subreddit list in ~*reddigg-main*~, ~r/all~ and
-~r/popular~ are included.
 
-~reddigg-view-sub~: prompt for a subreddits and show it,
+~reddigg-view-main~ shows your subreddit list.
 
-~reddigg-view-frontpage~: view frontpage
+~reddigg-view-sub~ prompts for a subreddit and shows its posts.
 
-~reddigg-view-comments~: prompt for a post (eg:
-~r/emacs/comments/lfww57/weekly_tipstricketc_thread/~ or
-~https://www.reddit.com/r/emacs/comments/lfww57/weekly_tipstricketc_thread/~) and
-show it.
+~reddigg-view-frontpage~ shows the front page from ~reddigg-subs~.
+
+~reddigg-view-comments~ prompts for a post and shows its comments.
+
+~reddigg-submit-post~ starts a new post.
+
+~reddigg-refresh-session~ reloads the Reddit login data used for write actions.
+
+* Read posts
+
+1. Run ~reddigg-view-main~.
+2. Select a subreddit.
+3. Select a post.
+4. Enter on ~view comments~ to open its comments.
+
+* Vote
+
+Use these keys in a ~reddigg~ buffer.
+
+- ~C-c C-v u~: upvote.
+- ~C-c C-v d~: downvote.
+- ~C-c C-v 0~: clear the vote.
+
+The score updates in the current buffer.
+
+* Reply
+
+1. Place point on a post or comment.
+2. Press ~C-c C-v r~.
+3. Write the reply.
+4. Press ~C-c C-c~ to send it.
+5. Press ~C-c C-k~ to abort.
+
+The new comment appears under its parent.
+
+* Edit
+
+1. Place point on your post or comment.
+2. Press ~C-c C-v e~.
+3. Edit the text.
+4. Press ~C-c C-c~ to save it.
+5. Press ~C-c C-k~ to abort.
+
+~reddigg~ rejects edits for content from another user.
+
+Link posts do not have editable post text.
+
+* Delete
+
+1. Place point on your post or comment.
+2. Press ~C-c C-v x~.
+3. Confirm the delete prompt.
+
+~reddigg~ rejects deletes for content from another user.
+
+* Submit a post
+
+1. Run ~reddigg-submit-post~.
+2. Enter the subreddit name.
+3. Select ~self~ or ~link~.
+4. Enter the post title.
+5. Write the post body or link URL.
+6. Press ~C-c C-c~ to submit.
+7. Confirm that you want to view the new comments.
+
+For a ~self~ post, enter the post text.
+
+For a ~link~ post, enter the link URL.
+
+~reddigg~ reports the new post ID and URL after a successful submit.
+
+* Compose buffers
+
+~reddigg-compose-mode~ handles reply, edit, and submit buffers.
+
+Press ~C-c C-c~ to send the current compose buffer.
+
+Press ~C-c C-k~ to abort the current compose buffer.
+
+* Reddit session
+
+Write actions use the Reddit session in the browser.
+
+~reddigg~ reads the CSRF token and username from the Reddit page.
+
+~reddigg-refresh-session~ refreshes these values after a login change.
+
 * Remarks
-This mode only lets you view reddit. For a complete interaction with reddit check
-out https://github.com/ahungry/md4rd.
 
+~reddigg~ uses the Reddit API through JavaScript that runs inside the Reddit tab.
 
-  
+Keep the Reddit tab logged in while you use write commands.
+
+For a complete Reddit client, see [[https://github.com/ahungry/md4rd][md4rd]].
