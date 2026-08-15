@@ -731,9 +731,7 @@ body in this buffer to update it locally; refresh to see the change.")
 (defun reddigg-edit-at-point ()
   "Compose an edit to the post or comment at point.
 Only works on entries you authored; only self-posts and comments have
-editable text on reddit (link posts don't). Currently only supports
-entries in the sub/post listing and comments buffers that have their
-own heading -- not the top post shown at the top of a comments view."
+editable text on reddit (link posts don't)."
   (interactive)
   (let* ((thing (reddigg--thing-at-point))
          (id (plist-get thing :id))
@@ -970,7 +968,7 @@ after deleting the current line which should be the More button."
             (data (ht-get it "data"))
             (replies (ht-get data "replies"))
             (depth (ht-get data "depth"))
-            (my-level (make-string (1+ depth) ?*))
+            (my-level (make-string (+ 2 depth) ?*))
             begin end)
        (if (string= kind "more")
            ;; (insert level " reddigg: too many subcomments\n")
@@ -999,17 +997,32 @@ after deleting the current line which should be the More button."
    cmt-list))
 
 (defun reddigg--print-comment-1 (data)
-  "Print the post content from DATA.
-Return a value of `reddigg--cmt-list-id'"
+  "Print the post itself as a level-1 heading, so it's a full reddigg
+entry like any post or comment -- votable, replyable, editable, and
+deletable, same as everything nested under it.
+Return the value of `reddigg--cmt-list-id'."
   (let ((cmt (ht-get* (aref (ht-get* data "data" "children") 0) "data")) begin end)
+    (insert "* " (ht-get cmt "title") "\n")
+    (insert ":PROPERTIES:\n")
+    (insert (format ":REDDIGG_ID: %s\n" (ht-get cmt "name")))
+    (insert (format ":REDDIGG_AUTHOR: %s\n" (ht-get cmt "author")))
+    (insert (format ":REDDIGG_SUBREDDIT: %s\n" (ht-get cmt "subreddit")))
+    (insert (format ":REDDIGG_LIKES: %s\n" (reddigg--likes->string (ht-get cmt "likes"))))
+    (insert (format ":REDDIGG_SCORE: %s\n" (ht-get cmt "score")))
+    (insert (format ":REDDIGG_CREATED: %s\n" (reddigg--format-created (ht-get cmt "created_utc"))))
+    (insert ":END:\n")
+    (insert "| " (ht-get cmt "subreddit_name_prefixed") " | ")
+    (insert "score: " (format "%s" (ht-get cmt "score")) " | ")
+    (insert "author: " (ht-get cmt "author") " | ")
+    (insert "created: " (reddigg--format-created (ht-get cmt "created_utc")) "\n")
     (insert (ht-get cmt "url") "\n")
-    (insert "author: " (ht-get cmt "author") "\n")
     (insert (format "[[elisp:(reddigg--view-comments \"%s\" t)][refresh]]\n"
                     (ht-get cmt "permalink")))
-    (setq begin (point))
+    (setq begin (point-marker))
     (insert (gethash "selftext" cmt) "\n")
-    (setq end (point))
+    (setq end (point-marker))
     (reddigg--sanitize-range begin end)
+    (reddigg--mark-body-overlay begin end)
     ;; get value for `reddigg--cmt-list-id'
     (ht-get cmt "name")))
 
@@ -1021,12 +1034,21 @@ Return a value of `reddigg--cmt-list-id'"
   "Print comments DATA to buffer."
   (with-current-buffer (reddigg--get-cmt-buffer)
     (erase-buffer)
-    (insert "#+startup: overview indent\n")
+    (insert "#+startup: show2levels indent\n")
     (insert (format "#+title: comments for '%s'\n"
                     (ht-get* (aref (ht-get* (aref data 0) "data" "children") 0) "data" "title")))
     (let ((post-id (reddigg--print-comment-1 (aref data 0))))
       (reddigg--print-comment-2 (aref data 1) "*")
       (reddigg--ensure-modes)
+      ;; `overview' startup visibility (set by `reddigg--ensure-modes' via
+      ;; `org-set-startup-visibility') folds the post's own body along
+      ;; with all the comments underneath it -- reveal just the post's
+      ;; own entry (heading + body, not its comment children) so it
+      ;; still reads the way it always has.
+      (goto-char (point-min))
+      (when (re-search-forward "^\\* " nil t)
+        (beginning-of-line)
+        (org-show-entry))
       ;; must set here after org-mode is in otherwise when org-mode kicks in all
       ;; local variables will be killed
       (setq reddigg--cmt-list-id post-id))))
