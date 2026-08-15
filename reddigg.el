@@ -5,7 +5,7 @@
 ;; Author: Thanh Vuong <thanhvg@gmail.com>
 ;; URL: https://github.com/thanhvg/emacs-reddigg
 ;; Package-Requires: ((emacs "26.3") (promise "1.1") (ht "2.3") (org "9.2"))
-;; Version: 0.6.0
+;; Version: 0.7.0
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -583,6 +583,15 @@ readable timestamp, or \"unknown\" if EPOCH isn't a number."
 (defvar-local reddigg-compose--extra-fields nil
   "Alist of extra POST fields the specific kind needs (e.g. thing_id for edit).")
 
+(defvar-local reddigg-compose--submit-sr nil
+  "Subreddit name for a `submit' compose buffer.")
+
+(defvar-local reddigg-compose--submit-kind nil
+  "Reddit submission kind (`self' or `link') for a `submit' compose buffer.")
+
+(defvar-local reddigg-compose--submit-title nil
+  "Submission title for a `submit' compose buffer.")
+
 (defvar reddigg-compose-mode-map
   (let ((m (make-sparse-keymap)))
     (define-key m (kbd "C-c C-c") #'reddigg-compose-send)
@@ -619,6 +628,7 @@ readable timestamp, or \"unknown\" if EPOCH isn't a number."
     (pcase kind
       ('comment (reddigg--send-comment buf body))
       ('edit (reddigg--send-edit buf body))
+      ('submit (reddigg--send-submit buf body))
       (_ (error "reddigg: compose kind %S not implemented yet" kind)))))
 
 (defun reddigg--insert-new-comment (parent-marker comment-data)
@@ -686,6 +696,77 @@ response; refresh to see it.")))
       (setq-local reddigg-compose--target-marker parent-marker)
       (insert (format "# reddigg: replying to %s\n" parent-id))
       (insert "# reddigg: C-c C-c to send, C-c C-k to abort\n\n"))
+    (pop-to-buffer buf)
+    (goto-char (point-max))))
+
+(defconst reddigg--submit-path "https://old.reddit.com/api/submit")
+
+(defun reddigg--submit-comments-path (post-id)
+  "Return a reddigg comments path for the submitted POST-ID."
+  (format "comments/%s" (replace-regexp-in-string "\\`t3_" "" post-id)))
+
+(defun reddigg--send-submit (compose-buffer body)
+  "Submit the post described by COMPOSE-BUFFER with BODY."
+  (let ((subreddit (buffer-local-value 'reddigg-compose--submit-sr compose-buffer))
+        (kind (buffer-local-value 'reddigg-compose--submit-kind compose-buffer))
+        (title (buffer-local-value 'reddigg-compose--submit-title compose-buffer)))
+    (promise-chain
+        (reddigg--promise-post
+         reddigg--submit-path
+         (append (list (cons "sr" subreddit)
+                       (cons "kind" kind)
+                       (cons "title" title))
+                 (list (cons (if (equal kind "link") "url" "text") body))))
+      (then
+       (lambda (data)
+         (let* ((json (gethash "json" data))
+                (payload (and (hash-table-p json) (gethash "data" json)))
+                (post-id (and (hash-table-p payload) (gethash "name" payload)))
+                (post-url (and (hash-table-p payload) (gethash "url" payload)))
+                (comments-path (and post-id
+                                    (reddigg--submit-comments-path post-id))))
+           (when (buffer-live-p compose-buffer)
+             (kill-buffer compose-buffer))
+           (message "reddigg: post submitted%s%s"
+                    (if post-id (format " (%s)" post-id) "")
+                    (if post-url (format " %s" post-url) ""))
+           (when (and comments-path
+                      (y-or-n-p "reddigg: view the new post's comments? "))
+             (reddigg--view-comments comments-path t)))))
+      (promise-catch
+       (lambda (reason)
+         (message "reddigg: submit failed: %s" reason))))))
+
+;;;###autoload
+(defun reddigg-submit-post ()
+  "Compose and submit a new Reddit post."
+  (interactive)
+  (let* ((choices (mapcar (lambda (sub) (if (symbolp sub)
+                                            (symbol-name sub)
+                                          sub))
+                          reddigg-subs))
+         (subreddit (string-trim
+                     (completing-read "Subreddit: " choices nil nil)))
+         (kind (completing-read "Post kind: " '("self" "link") nil t))
+         (title (string-trim (read-string "Title: ")))
+         (buf (generate-new-buffer "*reddigg-submit*")))
+    (when (string-empty-p subreddit)
+      (user-error "reddigg: subreddit cannot be empty"))
+    (when (string-empty-p title)
+      (user-error "reddigg: title cannot be empty"))
+    (with-current-buffer buf
+      (org-mode)
+      (reddigg-compose-mode 1)
+      (setq-local reddigg-compose--kind 'submit)
+      (setq-local reddigg-compose--submit-sr subreddit)
+      (setq-local reddigg-compose--submit-kind kind)
+      (setq-local reddigg-compose--submit-title title)
+      (insert (format "# reddigg: submitting to r/%s\n" subreddit))
+      (insert (format "# reddigg: %s post: %s\n" kind title))
+      (insert "# reddigg: C-c C-c to submit, C-c C-k to abort\n\n")
+      (insert (if (equal kind "link")
+                  "# Paste the link URL below.\n"
+                "# Write the post body below.\n")))
     (pop-to-buffer buf)
     (goto-char (point-max))))
 
