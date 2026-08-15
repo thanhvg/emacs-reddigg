@@ -116,17 +116,25 @@ than one browser is connected to Emacs at the same time."
 (defvar reddigg--current-user nil
   "Cached logged-in reddit username, scraped from the reddit tab.")
 
+(defconst reddigg--json-false :reddigg-false
+  "Sentinel representing JSON `false', kept distinct from `null'/missing
+when parsing reddit API responses. Needed for fields like \"likes\",
+where true = upvoted, this sentinel = downvoted, and nil = no vote /
+not present -- collapsing false and null together (the old behavior)
+made \"downvoted\" indistinguishable from \"never voted\".")
+
 (defun reddigg--parse-json-string (text)
   "Parse JSON TEXT the way reddit's API responses should be read:
-hash-tables for objects, nil for both JSON null and false."
+hash-tables for objects, nil for JSON null, and `reddigg--json-false'
+for JSON false."
   (if (fboundp 'json-parse-string)
       (json-parse-string text
                           :object-type 'hash-table
                           :null-object nil
-                          :false-object nil)
+                          :false-object reddigg--json-false)
     (let ((json-array-type 'vector)
           (json-object-type 'hash-table)
-          (json-false nil))
+          (json-false reddigg--json-false))
       (json-read-from-string text))))
 
 (defun reddigg--parse-json-buffer ()
@@ -459,25 +467,52 @@ and signals an error if the API reports one."
 ;;; --- Thing identity (posts/comments) at point ----------------------------
 
 (defun reddigg--thing-at-point ()
-  "Return (ID . AUTHOR) for the reddigg entry at point, or user-error."
+  "Return (:id ID :author AUTHOR :subreddit SUBREDDIT) for the reddigg
+entry at point, or user-error."
   (save-excursion
     (condition-case nil
         (org-back-to-heading t)
       (error (user-error "reddigg: point is not on a reddigg entry")))
     (let ((id (org-entry-get (point) "REDDIGG_ID"))
-          (author (org-entry-get (point) "REDDIGG_AUTHOR")))
+          (author (org-entry-get (point) "REDDIGG_AUTHOR"))
+          (subreddit (org-entry-get (point) "REDDIGG_SUBREDDIT")))
       (unless id
         (user-error "reddigg: no reddit item at point (missing REDDIGG_ID)"))
-      (cons id author))))
+      (list :id id :author author :subreddit subreddit))))
+
+(defun reddigg--mark-body-overlay (start end)
+  "Wrap START..END (markers or positions) in an overlay tagging it as
+this entry's editable body text, so `reddigg-edit-at-point' can find
+and replace it later without needing to re-fetch from reddit."
+  (let ((ov (make-overlay start end nil t nil)))
+    (overlay-put ov 'reddigg-body t)
+    ov))
+
+(defun reddigg--find-body-overlay ()
+  "Find the body overlay for the reddigg entry at point, or nil."
+  (save-excursion
+    (org-back-to-heading t)
+    (let ((subtree-end (save-excursion (org-end-of-subtree t t) (point))))
+      (car (seq-filter (lambda (ov) (overlay-get ov 'reddigg-body))
+                       (overlays-in (point) subtree-end))))))
+
+(defun reddigg--likes->string (value)
+  "Convert a raw reddit \"likes\" JSON VALUE into \"up\"/\"down\"/\"none\".
+VALUE is t (upvoted), `reddigg--json-false' (downvoted), or nil (no
+vote / not present)."
+  (cond
+   ((eq value t) "up")
+   ((eq value reddigg--json-false) "down")
+   (t "none")))
 
 ;;; --- Voting ---------------------------------------------------------------
 
-(defconst reddigg--vote-path "/api/vote")
+(defconst reddigg--vote-path "https://old.reddit.com/api/vote")
 
 (defun reddigg--vote (dir)
   "Vote DIR (1, -1, or 0) on the reddigg entry at point."
   (let* ((thing (reddigg--thing-at-point))
-         (id (car thing))
+         (id (plist-get thing :id))
          (marker (point-marker)))
     (promise-chain (reddigg--promise-post reddigg--vote-path
                                           (list (cons "id" id) (cons "dir" dir)))
@@ -557,6 +592,7 @@ and signals an error if the API reports one."
       (user-error "reddigg: empty body, nothing to send"))
     (pcase kind
       ('comment (reddigg--send-comment buf body))
+      ('edit (reddigg--send-edit buf body))
       (_ (error "reddigg: compose kind %S not implemented yet" kind)))))
 
 (defun reddigg--insert-new-comment (parent-marker comment-data)
@@ -577,10 +613,12 @@ as a new child heading under PARENT-MARKER's entry."
           (insert ":PROPERTIES:\n")
           (insert (format ":REDDIGG_ID: %s\n" name))
           (insert (format ":REDDIGG_AUTHOR: %s\n" author))
+          (insert (format ":REDDIGG_SUBREDDIT: %s\n" (gethash "subreddit" comment-data)))
+          (insert (format ":REDDIGG_LIKES: %s\n" (reddigg--likes->string (gethash "likes" comment-data))))
           (insert ":END:\n")
           (insert body "\n"))))))
 
-(defconst reddigg--comment-path "/api/comment")
+(defconst reddigg--comment-path "https://old.reddit.com/api/comment")
 
 (defun reddigg--send-comment (compose-buffer body)
   (let ((parent-id (buffer-local-value 'reddigg-compose--parent-id compose-buffer))
@@ -609,7 +647,7 @@ response; refresh to see it.")))
   "Compose a reply to the post or comment at point."
   (interactive)
   (let* ((thing (reddigg--thing-at-point))
-         (parent-id (car thing))
+         (parent-id (plist-get thing :id))
          (parent-marker (point-marker))
          (buf (generate-new-buffer "*reddigg-reply*")))
     (with-current-buffer buf
@@ -623,7 +661,101 @@ response; refresh to see it.")))
     (pop-to-buffer buf)
     (goto-char (point-max))))
 
-;;; --- View-buffer keymap (voting, replying) ---------------------------------
+;;; --- Edit / delete your own content ----------------------------------------
+
+(defconst reddigg--editusertext-path "https://old.reddit.com/api/editusertext")
+(defconst reddigg--del-path "https://old.reddit.com/api/del")
+
+(defun reddigg--replace-body-at-marker (heading-marker new-text)
+  "Replace the editable body text of the reddigg entry at HEADING-MARKER
+with NEW-TEXT (the raw markdown just submitted to reddit)."
+  (with-current-buffer (marker-buffer heading-marker)
+    (let ((inhibit-read-only t))
+      (save-excursion
+        (goto-char heading-marker)
+        (org-back-to-heading t)
+        (let ((ov (reddigg--find-body-overlay)))
+          (if (not ov)
+              (message "reddigg: edit saved on reddit, but couldn't find the \
+body in this buffer to update it locally; refresh to see the change.")
+            (let ((start (overlay-start ov)))
+              (goto-char start)
+              (delete-region start (overlay-end ov))
+              (insert new-text "\n")
+              (move-overlay ov start (point))
+              (reddigg--sanitize-range start (point)))))))))
+
+(defun reddigg--send-edit (compose-buffer body)
+  (let ((thing-id (buffer-local-value 'reddigg-compose--parent-id compose-buffer))
+        (target-marker (buffer-local-value 'reddigg-compose--target-marker compose-buffer)))
+    (promise-chain (reddigg--promise-post reddigg--editusertext-path
+                                          (list (cons "thing_id" thing-id)
+                                                (cons "text" body)))
+      (then (lambda (_data)
+              (reddigg--replace-body-at-marker target-marker body)
+              (when (buffer-live-p compose-buffer)
+                (kill-buffer compose-buffer))
+              (message "reddigg: edit saved")))
+      (promise-catch (lambda (reason)
+                       (message "reddigg: edit failed: %s" reason))))))
+
+;;;###autoload
+(defun reddigg-edit-at-point ()
+  "Compose an edit to the post or comment at point.
+Only works on entries you authored; only self-posts and comments have
+editable text on reddit (link posts don't). Currently only supports
+entries in the sub/post listing and comments buffers that have their
+own heading -- not the top post shown at the top of a comments view."
+  (interactive)
+  (let* ((thing (reddigg--thing-at-point))
+         (id (plist-get thing :id))
+         (author (plist-get thing :author)))
+    (unless (and reddigg--current-user (equal author reddigg--current-user))
+      (user-error "reddigg: this entry isn't yours to edit (author: %s)"
+                 (or author "unknown")))
+    (let* ((ov (reddigg--find-body-overlay))
+           (existing-text (when ov
+                            (buffer-substring-no-properties
+                             (overlay-start ov) (overlay-end ov))))
+           (marker (point-marker))
+           (buf (generate-new-buffer "*reddigg-edit*")))
+      (with-current-buffer buf
+        (org-mode)
+        (reddigg-compose-mode 1)
+        (setq-local reddigg-compose--kind 'edit)
+        (setq-local reddigg-compose--parent-id id)
+        (setq-local reddigg-compose--target-marker marker)
+        (insert (format "# reddigg: editing %s\n" id))
+        (insert "# reddigg: C-c C-c to save, C-c C-k to abort\n\n")
+        (when existing-text (insert existing-text)))
+      (pop-to-buffer buf)
+      (goto-char (point-max)))))
+
+;;;###autoload
+(defun reddigg-delete-at-point ()
+  "Delete the post or comment at point. Only works on entries you authored."
+  (interactive)
+  (let* ((thing (reddigg--thing-at-point))
+         (id (plist-get thing :id))
+         (author (plist-get thing :author))
+         (marker (point-marker)))
+    (unless (and reddigg--current-user (equal author reddigg--current-user))
+      (user-error "reddigg: this entry isn't yours to delete (author: %s)"
+                 (or author "unknown")))
+    (when (y-or-n-p "reddigg: really delete this? ")
+      (promise-chain (reddigg--promise-post reddigg--del-path (list (cons "id" id)))
+        (then (lambda (_data)
+                (with-current-buffer (marker-buffer marker)
+                  (let ((inhibit-read-only t))
+                    (save-excursion
+                      (goto-char marker)
+                      (org-back-to-heading t)
+                      (org-cut-subtree))))
+                (message "reddigg: deleted")))
+        (promise-catch (lambda (reason)
+                         (message "reddigg: delete failed: %s" reason)))))))
+
+;;; --- View-buffer keymap (voting, replying, editing, deleting) --------------
 
 (defvar reddigg-view-mode-map
   (let ((m (make-sparse-keymap)))
@@ -631,6 +763,8 @@ response; refresh to see it.")))
     (define-key m (kbd "C-c C-v d") #'reddigg-vote-down)
     (define-key m (kbd "C-c C-v 0") #'reddigg-vote-clear)
     (define-key m (kbd "C-c C-v r") #'reddigg-reply-at-point)
+    (define-key m (kbd "C-c C-v e") #'reddigg-edit-at-point)
+    (define-key m (kbd "C-c C-v x") #'reddigg-delete-at-point)
     m)
   "Keymap for reddigg's generated browsing buffers.")
 
@@ -765,6 +899,8 @@ after deleting the current line which should be the More button."
            (insert ":PROPERTIES:\n")
            (insert (format ":REDDIGG_ID: %s\n" (gethash "name" my-it)))
            (insert (format ":REDDIGG_AUTHOR: %s\n" (gethash "author" my-it)))
+           (insert (format ":REDDIGG_SUBREDDIT: %s\n" (gethash "subreddit" my-it)))
+           (insert (format ":REDDIGG_LIKES: %s\n" (reddigg--likes->string (gethash "likes" my-it))))
            (insert ":END:\n")
            (insert "| " (ht-get my-it "subreddit_name_prefixed") " | ")
            (insert "score: " (format "%s" (gethash "score" my-it) ) " | ")
@@ -774,10 +910,11 @@ after deleting the current line which should be the More button."
              (if (string-empty-p selftext)
                  (insert (format "%s \n[[eww:%s][view in eww]]\n"
                                  (gethash "url" my-it) (gethash "url" my-it)))
-               (setq begin (point))
+               (setq begin (point-marker))
                (insert "\n" selftext "\n")
-               (setq end (point))
-               (reddigg--sanitize-range begin end)))
+               (setq end (point-marker))
+               (reddigg--sanitize-range begin end)
+               (reddigg--mark-body-overlay begin end)))
            (insert (format "[[elisp:(reddigg--view-comments \"%s\")][view comments]]\n"
                            (ht-get my-it "permalink")))))
        (ht-get data "children"))
@@ -817,11 +954,14 @@ after deleting the current line which should be the More button."
          (insert ":PROPERTIES:\n")
          (insert (format ":REDDIGG_ID: %s\n" (ht-get data "name")))
          (insert (format ":REDDIGG_AUTHOR: %s\n" (ht-get data "author")))
+         (insert (format ":REDDIGG_SUBREDDIT: %s\n" (ht-get data "subreddit")))
+         (insert (format ":REDDIGG_LIKES: %s\n" (reddigg--likes->string (ht-get data "likes"))))
          (insert ":END:\n")
-         (setq begin (point))
+         (setq begin (point-marker))
          (insert (ht-get data "body") "\n")
-         (setq end (point))
+         (setq end (point-marker))
          (reddigg--sanitize-range begin end)
+         (reddigg--mark-body-overlay begin end)
          (when (hash-table-p replies)
            (reddigg--print-comment-list (ht-get* replies "data" "children") (concat level "*"))))))
    cmt-list))
