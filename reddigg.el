@@ -505,6 +505,19 @@ vote / not present)."
    ((eq value reddigg--json-false) "down")
    (t "none")))
 
+(defun reddigg--likes-string->number (s)
+  "Inverse of `reddigg--likes->string': \"up\"/\"down\"/\"none\" (or nil,
+treated as \"none\") to 1/-1/0."
+  (cond ((equal s "up") 1)
+        ((equal s "down") -1)
+        (t 0)))
+
+(defun reddigg--bump-score (delta)
+  "Add DELTA to the :REDDIGG_SCORE: property of the heading at point."
+  (let* ((current (org-entry-get (point) "REDDIGG_SCORE"))
+         (current-n (if current (string-to-number current) 0)))
+    (org-entry-put (point) "REDDIGG_SCORE" (number-to-string (+ current-n delta)))))
+
 (defun reddigg--format-created (epoch)
   "Format EPOCH (reddit's \"created_utc\", seconds since epoch) as a
 readable timestamp, or \"unknown\" if EPOCH isn't a number."
@@ -528,10 +541,16 @@ readable timestamp, or \"unknown\" if EPOCH isn't a number."
                 (save-excursion
                   (goto-char marker)
                   (org-back-to-heading t)
-                  (org-entry-put (point) "REDDIGG_LIKES"
-                                 (pcase dir (1 "up") (-1 "down") (_ "none")))
-                  (message "reddigg: %s"
-                          (pcase dir (1 "upvoted") (-1 "downvoted") (_ "vote cleared")))))))
+                  (let* ((old-numeric (reddigg--likes-string->number
+                                       (org-entry-get (point) "REDDIGG_LIKES")))
+                         (delta (- dir old-numeric)))
+                    (reddigg--bump-score delta)
+                    (org-entry-put (point) "REDDIGG_LIKES"
+                                   (pcase dir (1 "up") (-1 "down") (_ "none")))
+                    (message "reddigg: %s (score %s%s)"
+                            (pcase dir (1 "upvoted") (-1 "downvoted") (_ "vote cleared"))
+                            (if (>= delta 0) "+" "")
+                            delta))))))
       (promise-catch (lambda (reason)
                        (message "reddigg: vote failed: %s" reason))))))
 
