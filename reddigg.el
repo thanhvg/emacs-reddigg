@@ -169,7 +169,8 @@ hash-tables for objects, nil for both JSON null and false."
       (org-set-startup-visibility)
     (org-mode)
     (font-lock-flush))
-  (visual-line-mode))
+  (visual-line-mode)
+  (reddigg-view-mode 1))
 
 (defvar reddigg-replacement-list
   '(("^\\* " . "- ")
@@ -761,6 +762,10 @@ after deleting the current line which should be the More button."
        (lambda (it)
          (let ((my-it (gethash "data" it)))
            (insert "* " (gethash "title" my-it) "\n")
+           (insert ":PROPERTIES:\n")
+           (insert (format ":REDDIGG_ID: %s\n" (gethash "name" my-it)))
+           (insert (format ":REDDIGG_AUTHOR: %s\n" (gethash "author" my-it)))
+           (insert ":END:\n")
            (insert "| " (ht-get my-it "subreddit_name_prefixed") " | ")
            (insert "score: " (format "%s" (gethash "score" my-it) ) " | ")
            (insert "comments: " (format "%s" (gethash "num_comments" my-it)) " | ")
@@ -809,6 +814,10 @@ after deleting the current line which should be the More button."
                            (ht-get data "count")))
 
          (insert my-level " " (ht-get data "author") "\n")
+         (insert ":PROPERTIES:\n")
+         (insert (format ":REDDIGG_ID: %s\n" (ht-get data "name")))
+         (insert (format ":REDDIGG_AUTHOR: %s\n" (ht-get data "author")))
+         (insert ":END:\n")
          (setq begin (point))
          (insert (ht-get data "body") "\n")
          (setq end (point))
