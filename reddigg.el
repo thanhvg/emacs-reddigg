@@ -505,6 +505,13 @@ vote / not present)."
    ((eq value reddigg--json-false) "down")
    (t "none")))
 
+(defun reddigg--format-created (epoch)
+  "Format EPOCH (reddit's \"created_utc\", seconds since epoch) as a
+readable timestamp, or \"unknown\" if EPOCH isn't a number."
+  (if (numberp epoch)
+      (format-time-string "%Y-%m-%d %H:%M:%S" epoch)
+    "unknown"))
+
 ;;; --- Voting ---------------------------------------------------------------
 
 (defconst reddigg--vote-path "https://old.reddit.com/api/vote")
@@ -615,6 +622,8 @@ as a new child heading under PARENT-MARKER's entry."
           (insert (format ":REDDIGG_AUTHOR: %s\n" author))
           (insert (format ":REDDIGG_SUBREDDIT: %s\n" (gethash "subreddit" comment-data)))
           (insert (format ":REDDIGG_LIKES: %s\n" (reddigg--likes->string (gethash "likes" comment-data))))
+          (insert (format ":REDDIGG_SCORE: %s\n" (gethash "score" comment-data)))
+          (insert (format ":REDDIGG_CREATED: %s\n" (reddigg--format-created (gethash "created_utc" comment-data))))
           (insert ":END:\n")
           (insert body "\n"))))))
 
@@ -901,6 +910,8 @@ after deleting the current line which should be the More button."
            (insert (format ":REDDIGG_AUTHOR: %s\n" (gethash "author" my-it)))
            (insert (format ":REDDIGG_SUBREDDIT: %s\n" (gethash "subreddit" my-it)))
            (insert (format ":REDDIGG_LIKES: %s\n" (reddigg--likes->string (gethash "likes" my-it))))
+           (insert (format ":REDDIGG_SCORE: %s\n" (gethash "score" my-it)))
+           (insert (format ":REDDIGG_CREATED: %s\n" (reddigg--format-created (gethash "created_utc" my-it))))
            (insert ":END:\n")
            (insert "| " (ht-get my-it "subreddit_name_prefixed") " | ")
            (insert "score: " (format "%s" (gethash "score" my-it) ) " | ")
@@ -956,6 +967,8 @@ after deleting the current line which should be the More button."
          (insert (format ":REDDIGG_AUTHOR: %s\n" (ht-get data "author")))
          (insert (format ":REDDIGG_SUBREDDIT: %s\n" (ht-get data "subreddit")))
          (insert (format ":REDDIGG_LIKES: %s\n" (reddigg--likes->string (ht-get data "likes"))))
+         (insert (format ":REDDIGG_SCORE: %s\n" (ht-get data "score")))
+         (insert (format ":REDDIGG_CREATED: %s\n" (reddigg--format-created (ht-get data "created_utc"))))
          (insert ":END:\n")
          (setq begin (point-marker))
          (insert (ht-get data "body") "\n")
