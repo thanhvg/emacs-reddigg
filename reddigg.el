@@ -765,8 +765,8 @@ response; refresh to see it.")))
       (insert (format "# reddigg: %s post: %s\n" kind title))
       (insert "# reddigg: C-c C-c to submit, C-c C-k to abort\n\n")
       (insert (if (equal kind "link")
-                  "# Paste the link URL below.\n"
-                "# Write the post body below.\n")))
+                  "# reddigg: Paste the link URL below.\n"
+                "# reddigg: Write the post body below.\n")))
     (pop-to-buffer buf)
     (goto-char (point-max))))
 
