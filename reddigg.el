@@ -632,7 +632,7 @@ readable timestamp, or \"unknown\" if EPOCH isn't a number."
       (_ (error "reddigg: compose kind %S not implemented yet" kind)))))
 
 (defun reddigg--insert-new-comment (parent-marker comment-data)
-  "Insert COMMENT-DATA (a hash-table from reddit's api/comment response)
+  "Insert COMMENT-DATA (a hash-table, see `reddigg--comment-data-with-fallback')
 as a new child heading under PARENT-MARKER's entry."
   (with-current-buffer (marker-buffer parent-marker)
     (let ((inhibit-read-only t))
@@ -640,14 +640,9 @@ as a new child heading under PARENT-MARKER's entry."
         (goto-char parent-marker)
         (org-back-to-heading t)
         (let* ((level (org-current-level))
-               ;; Reddit's api/comment response doesn't always populate every
-               ;; field (e.g. author/body can come back nil for some reply
-               ;; types), and raw `insert' errors with
-               ;; (wrong-type-argument char-or-string-p nil) on a nil arg.
-               ;; Guard everything we pass to `insert' directly.
-               (author (or (gethash "author" comment-data) "[unknown]"))
-               (body (or (gethash "body" comment-data) ""))
-               (name (or (gethash "name" comment-data) "")))
+               (author (gethash "author" comment-data))
+               (body (gethash "body" comment-data))
+               (name (gethash "name" comment-data)))
           (org-end-of-subtree t t)
           (unless (bolp) (insert "\n"))
           (insert (make-string (1+ level) ?*) " " author "\n")
@@ -660,6 +655,34 @@ as a new child heading under PARENT-MARKER's entry."
           (insert (format ":REDDIGG_CREATED: %s\n" (reddigg--format-created (gethash "created_utc" comment-data))))
           (insert ":END:\n")
           (insert body "\n"))))))
+
+(defun reddigg--comment-data-with-fallback (server-comment local-body)
+  "Build a comment-data hash-table to insert locally.
+
+By the time this is called the POST to reddit has already
+succeeded, so we don't want a partial/missing api/comment
+response (SERVER-COMMENT, possibly nil, possibly missing keys)
+to stop us from showing the comment the user just made. Prefer
+whatever the server gave us field-by-field, and fall back to
+what we already know locally (the exact text we sent, the
+logged-in username) or a sane placeholder otherwise."
+  (let ((merged (make-hash-table :test 'equal))
+        (server-comment (or server-comment (make-hash-table :test 'equal))))
+    (puthash "author" (or (gethash "author" server-comment)
+                           reddigg--current-user
+                           "[unknown]")
+             merged)
+    ;; The body we sent is authoritative: it's exactly what reddit received,
+    ;; so prefer it over anything (or nothing) the server echoes back.
+    (puthash "body" (or local-body (gethash "body" server-comment) "") merged)
+    (puthash "name" (or (gethash "name" server-comment) "") merged)
+    (puthash "subreddit" (gethash "subreddit" server-comment) merged)
+    (puthash "likes" (gethash "likes" server-comment) merged)
+    (puthash "score" (or (gethash "score" server-comment) 1) merged)
+    (puthash "created_utc" (or (gethash "created_utc" server-comment)
+                                (float-time))
+             merged)
+    merged))
 
 (defconst reddigg--comment-path "https://old.reddit.com/api/comment")
 
@@ -679,12 +702,11 @@ as a new child heading under PARENT-MARKER's entry."
                   (let* ((json (gethash "json" data))
                          (things (and json (gethash "data" json)
                                       (gethash "things" (gethash "data" json))))
-                         (comment (and things (> (length things) 0)
-                                       (gethash "data" (aref things 0)))))
-                    (if comment
-                        (reddigg--insert-new-comment target-marker comment)
-                      (message "reddigg: comment posted, but couldn't parse the \
-response; refresh to see it.")))
+                         (server-comment (and things (> (length things) 0)
+                                               (gethash "data" (aref things 0)))))
+                    (reddigg--insert-new-comment
+                     target-marker
+                     (reddigg--comment-data-with-fallback server-comment body)))
                 (error
                  (message "reddigg: comment posted, but displaying it locally \
 failed (%s); refresh to see it." (error-message-string err))))
