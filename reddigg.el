@@ -639,10 +639,15 @@ as a new child heading under PARENT-MARKER's entry."
       (save-excursion
         (goto-char parent-marker)
         (org-back-to-heading t)
-        (let ((level (org-current-level))
-              (author (gethash "author" comment-data))
-              (body (gethash "body" comment-data))
-              (name (gethash "name" comment-data)))
+        (let* ((level (org-current-level))
+               ;; Reddit's api/comment response doesn't always populate every
+               ;; field (e.g. author/body can come back nil for some reply
+               ;; types), and raw `insert' errors with
+               ;; (wrong-type-argument char-or-string-p nil) on a nil arg.
+               ;; Guard everything we pass to `insert' directly.
+               (author (or (gethash "author" comment-data) "[unknown]"))
+               (body (or (gethash "body" comment-data) ""))
+               (name (or (gethash "name" comment-data) "")))
           (org-end-of-subtree t t)
           (unless (bolp) (insert "\n"))
           (insert (make-string (1+ level) ?*) " " author "\n")
@@ -665,15 +670,24 @@ as a new child heading under PARENT-MARKER's entry."
                                           (list (cons "thing_id" parent-id)
                                                 (cons "text" body)))
       (then (lambda (data)
-              (let* ((json (gethash "json" data))
-                     (things (and json (gethash "data" json)
-                                  (gethash "things" (gethash "data" json))))
-                     (comment (and things (> (length things) 0)
-                                   (gethash "data" (aref things 0)))))
-                (if comment
-                    (reddigg--insert-new-comment target-marker comment)
-                  (message "reddigg: comment posted, but couldn't parse the \
+              ;; The POST has already succeeded by this point. Everything
+              ;; below is best-effort local rendering, so wrap it in
+              ;; condition-case rather than letting a display bug propagate
+              ;; up to promise-catch, where it would be misreported as a
+              ;; failed reply even though reddit already has the comment.
+              (condition-case err
+                  (let* ((json (gethash "json" data))
+                         (things (and json (gethash "data" json)
+                                      (gethash "things" (gethash "data" json))))
+                         (comment (and things (> (length things) 0)
+                                       (gethash "data" (aref things 0)))))
+                    (if comment
+                        (reddigg--insert-new-comment target-marker comment)
+                      (message "reddigg: comment posted, but couldn't parse the \
 response; refresh to see it.")))
+                (error
+                 (message "reddigg: comment posted, but displaying it locally \
+failed (%s); refresh to see it." (error-message-string err))))
               (when (buffer-live-p compose-buffer)
                 (kill-buffer compose-buffer))
               (message "reddigg: reply posted")))
