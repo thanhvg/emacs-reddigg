@@ -13,7 +13,7 @@ It also lets you vote, reply, edit, delete, and submit posts.
 
 Reddit requests now require a logged-in browser session for these actions.
 
-~reddigg.el~ uses [[https://github.com/dmgerman/browsel][browsel]] to run Reddit requests inside your browser.
+~reddigg.el~ uses [[https://github.com/dmgerman/browser-gt][browser-gt]] to run Reddit requests inside your browser.
 
 * Requirements
 
@@ -21,15 +21,15 @@ Reddit requests now require a logged-in browser session for these actions.
 - ~promise~ 1.1 or later.
 - ~ht~ 2.3 or later.
 - ~org~ 9.2 or later.
-- [[https://github.com/dmgerman/browsel][browsel]] with its Emacs package and browser extension.
+- [[https://github.com/dmgerman/browser-gt][browser-gt]] with its Emacs package and browser extension.
 - A logged-in Reddit session in the browser.
 
 * Setup
 
 1. Install the required Emacs packages.
-2. Install and configure ~browsel~.
-3. Start the ~browsel~ Emacs client.
-4. Load the ~browsel~ browser extension.
+2. Install and configure ~browser-gt~.
+3. Start the ~browser-gt~ Emacs client.
+4. Load the ~browser-gt~ browser extension.
 5. Log in to Reddit in that browser.
 6. Open a Reddit tab in that browser.
 7. Load ~reddigg.el~ in Emacs.
@@ -52,7 +52,7 @@ Enter on a Reddit link to run its Emacs command.
 
 ~reddigg-subs~ lists the subreddits for ~*reddigg-main*~.
 
-~reddigg-browsel-client~ selects a browser client when more than one client connects.
+~reddigg-browser-gt-client~ selects a browser client when more than one client connects.
 
 Set it to ~nil~ for automatic client selection.
 
@@ -60,7 +60,7 @@ Set it to ~nil~ for automatic client selection.
 
 ~reddigg-reddit-open-url~ sets the URL that ~reddigg~ opens when no Reddit tab exists.
 
-~reddigg-browsel-tab-wait-timeout~ sets the wait time for a new Reddit tab.
+~reddigg-browser-gt-tab-wait-timeout~ sets the wait time for a new Reddit tab.
 
 * Commands
 

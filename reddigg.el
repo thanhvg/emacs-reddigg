@@ -5,7 +5,7 @@
 ;; Author: Thanh Vuong <thanhvg@gmail.com>
 ;; URL: https://github.com/thanhvg/emacs-reddigg
 ;; Package-Requires: ((emacs "26.3") (promise "1.1") (ht "2.3") (org "9.2"))
-;; Version: 0.7.0
+;; Version: 0.7.1
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -25,13 +25,13 @@
 ;;
 ;; Reddit now requires a logged-in, browser-driven session for its
 ;; JSON endpoints, so reddigg no longer talks to old.reddit.com
-;; directly with `url-retrieve'.  Instead it uses the `browsel'
-;; package (https://github.com/dmgerman/browsel) to run the fetch
+;; directly with `url-retrieve'.  Instead it uses the `browser-gt'
+;; package (https://github.com/dmgerman/browser-gt) to run the fetch
 ;; *inside* an already-open, already-authenticated reddit tab in
 ;; your real browser, and reads the resulting JSON text back into
 ;; Emacs.  You must:
-;;   1. Have `browsel' set up and running (see its README) with both
-;;      the Emacs side (`browsel-start') and the browser extension
+;;   1. Have `browser-gt' set up and running (see its README) with both
+;;      the Emacs side (`browser-gt-start') and the browser extension
 ;;      loaded and connected.
 ;;   2. Be logged into old.reddit.com in that browser.
 ;; reddigg will look for an already-open reddit tab; if it can't
@@ -76,7 +76,7 @@
 ;; Soft-required: only needed once `reddigg-start' / a fetch actually
 ;; runs, but we want a clear error message rather than a void-function
 ;; error if it's missing.
-(require 'browsel nil t)
+(require 'browser-gt nil t)
 
 (defgroup reddigg nil
   "Search and read stackoverflow and sisters's sites."
@@ -88,9 +88,9 @@
   :type 'list
   :group 'reddigg)
 
-(defcustom reddigg-browsel-client nil
-  "Browser client name (\"chrome\" or \"firefox\") to address via browsel.
-Leave nil to let browsel pick automatically; only required when more
+(defcustom reddigg-browser-gt-client nil
+  "Browser client name (\"chrome\" or \"firefox\") to address via browser-gt.
+Leave nil to let browser-gt pick automatically; only required when more
 than one browser is connected to Emacs at the same time."
   :type '(choice (const :tag "Auto" nil) string)
   :group 'reddigg)
@@ -105,7 +105,7 @@ than one browser is connected to Emacs at the same time."
   :type 'string
   :group 'reddigg)
 
-(defcustom reddigg-browsel-tab-wait-timeout 20
+(defcustom reddigg-browser-gt-tab-wait-timeout 20
   "Seconds to wait for a freshly opened reddit tab to finish loading."
   :type 'number
   :group 'reddigg)
@@ -224,18 +224,18 @@ SCOPE: hour, day, week, year, all."
                                  reddigg--cmt-list-id
                                  children)))
 
-;;; --- JSON fetching via browsel ------------------------------------------
+;;; --- JSON fetching via browser-gt ------------------------------------------
 ;;
 ;; Reddit's JSON endpoints now require a real, logged-in browser
-;; session, so all fetches go through `browsel', running inside an
+;; session, so all fetches go through `browser-gt', running inside an
 ;; open reddit tab.
 
-(defun reddigg--browsel-plist-tab-p (x)
+(defun reddigg--browser-gt-plist-tab-p (x)
   "Heuristic: does X look like a single tab plist (i.e. has an :id)?"
   (and (consp x) (plist-member x :id)))
 
-(defun reddigg--browsel-as-tab-list (x)
-  "Coerce a browsel response X into a list of tab plists.
+(defun reddigg--browser-gt-as-tab-list (x)
+  "Coerce a browser-gt response X into a list of tab plists.
 
 The exact response envelope for GET_ALL_TABS / OPEN_TAB isn't
 pinned down from the README alone (it's shown both as a bare list
@@ -244,26 +244,26 @@ either: a bare list, a vector, a single tab plist, or an envelope
 plist whose payload lives under :tabs, :result, or :tab."
   (cond
    ((null x) nil)
-   ((reddigg--browsel-plist-tab-p x) (list x))
+   ((reddigg--browser-gt-plist-tab-p x) (list x))
    ((vectorp x) (append x nil))
    ((and (consp x) (plist-member x :status))
-    (reddigg--browsel-as-tab-list (or (plist-get x :tabs)
+    (reddigg--browser-gt-as-tab-list (or (plist-get x :tabs)
                                        (plist-get x :result)
                                        (plist-get x :tab))))
    ((listp x) x)
    (t nil)))
 
-(defun reddigg--ensure-browsel ()
-  "Signal a clear error if `browsel' isn't loaded."
-  (unless (featurep 'browsel)
-    (user-error "reddigg: `browsel' is not loaded; install it and \
-require it (or add it to your `use-package browsel' config) before \
+(defun reddigg--ensure-browser-gt ()
+  "Signal a clear error if `browser-gt' isn't loaded."
+  (unless (featurep 'browser-gt)
+    (user-error "reddigg: `browser-gt' is not loaded; install it and \
+require it (or add it to your `use-package browser-gt' config) before \
 using reddigg")))
 
 (defun reddigg--find-reddit-tab-id ()
   "Return the id of an already-open tab that looks like reddit, or nil."
-  (let* ((resp (browsel-request "GET_ALL_TABS" nil reddigg-browsel-client))
-         (tabs (reddigg--browsel-as-tab-list resp))
+  (let* ((resp (browser-gt-request "GET_ALL_TABS" nil reddigg-browser-gt-client))
+         (tabs (reddigg--browser-gt-as-tab-list resp))
          (tab (seq-find (lambda (tb)
                           (string-match-p reddigg-reddit-host-regexp
                                           (or (plist-get tb :url) "")))
@@ -272,8 +272,8 @@ using reddigg")))
 
 (defun reddigg--tab-ready-p (id)
   "Non-nil when tab ID exists, is done loading, and is on reddit."
-  (let* ((resp (browsel-request "GET_ALL_TABS" nil reddigg-browsel-client))
-         (tabs (reddigg--browsel-as-tab-list resp))
+  (let* ((resp (browser-gt-request "GET_ALL_TABS" nil reddigg-browser-gt-client))
+         (tabs (reddigg--browser-gt-as-tab-list resp))
          (tab (seq-find (lambda (tb) (equal (plist-get tb :id) id)) tabs)))
     (and tab
          (or (null (plist-get tab :status))
@@ -282,7 +282,7 @@ using reddigg")))
 
 (defun reddigg--wait-tab-ready (id)
   "Block (with `sit-for') until tab ID is ready or we time out."
-  (let ((deadline (+ (float-time) reddigg-browsel-tab-wait-timeout)))
+  (let ((deadline (+ (float-time) reddigg-browser-gt-tab-wait-timeout)))
     (while (and (< (float-time) deadline)
                 (not (reddigg--tab-ready-p id)))
       (sit-for 0.5))
@@ -295,9 +295,9 @@ using reddigg")))
                             reddigg-reddit-open-url))
     (user-error "reddigg: open %s in your browser and retry"
                reddigg-reddit-open-url))
-  (let* ((resp (browsel-request "OPEN_TAB" (list :url reddigg-reddit-open-url)
-                                reddigg-browsel-client))
-         (tab (car (reddigg--browsel-as-tab-list resp)))
+  (let* ((resp (browser-gt-request "OPEN_TAB" (list :url reddigg-reddit-open-url)
+                                reddigg-browser-gt-client))
+         (tab (car (reddigg--browser-gt-as-tab-list resp)))
          (id (plist-get tab :id)))
     (unless id
       (user-error "reddigg: could not open a reddit tab (response: %S)" resp))
@@ -340,21 +340,21 @@ JSON response body as a string."
 (defun reddigg--eval-json-promise (code &optional tab-id)
   "Run JS CODE in a reddit tab (finding/opening one unless TAB-ID is
 given). CODE must return a JSON string. Promise the parsed JSON."
-  (reddigg--ensure-browsel)
+  (reddigg--ensure-browser-gt)
   (promise-new
    (lambda (resolve reject)
      (condition-case err
          (let ((id (or tab-id (reddigg--reddit-tab-id t))))
-           (browsel-request-async
+           (browser-gt-request-async
             "EVAL_IN_ACTIVE_TAB"
             (list :tabId id :code code)
             (lambda (response)
               (reddigg--handle-eval-response response resolve reject))
-            reddigg-browsel-client))
+            reddigg-browser-gt-client))
        (error (funcall reject err))))))
 
 (defun reddigg--promise-json (url)
-  "Promise the JSON at URL, fetched from inside a live reddit tab via browsel."
+  "Promise the JSON at URL, fetched from inside a live reddit tab via browser-gt."
   (reddigg--eval-json-promise (reddigg--fetch-js url)))
 
 ;;; --- CSRF / session info ------------------------------------------------
