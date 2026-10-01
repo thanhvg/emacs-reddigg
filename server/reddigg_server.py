@@ -55,12 +55,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import json
 import logging
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional
+from urllib.parse import parse_qs, unquote, urlparse
 
 import websockets
 from websockets.server import WebSocketServerProtocol
@@ -69,6 +73,8 @@ log = logging.getLogger("reddigg")
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 1979
+DEFAULT_REST_PORT = 1980
+REST_ROOT = "/reddigg"
 
 # Actions the userscript knows how to perform.  Kept in sync with
 # ``userscript/reddigg-ws.user.js``.
@@ -319,6 +325,165 @@ async def serve(
 
 
 # ---------------------------------------------------------------------------
+# HTTP/REST glue
+# ---------------------------------------------------------------------------
+
+def _route(path: str) -> Optional[tuple]:
+    """Map an HTTP path to ``(action, query-only?)``.
+
+    Returns the bridge action name for ``GET /reddigg/<action>``, or
+    ``None`` if the path is not a known REST route.  All state-changing
+    verbs take their arguments as JSON in the request body, so only the
+    read-only ``ping``/``session``/``get`` are offered via GET.
+    """
+    if not path.startswith(REST_ROOT + "/"):
+        return None
+    name = path[len(REST_ROOT) + 1 :].strip("/")
+    if name in {"ping", "session", "get"}:
+        return name
+    if name in {"vote", "comment", "edit", "delete", "submit"}:
+        return name
+    return None
+
+
+class _RESTHandler(BaseHTTPRequestHandler):
+    """One HTTP request handler; bridges onto the asyncio Bridge.
+
+    Runs on a worker thread inside :class:`ThreadingHTTPServer`.  Every
+    call is handed to the asyncio event loop via
+    ``asyncio.run_coroutine_threadsafe`` and its result awaited from
+    this thread.  ``server.bridge`` and ``server.loop`` are set by
+    :class:`RESTServer`.
+    """
+
+    server_version = "reddigg/0.1"
+
+    # keep the terminal tidy: log through our logger, not stderr
+    def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003
+        log.debug("rest %s - %s", self.address_string(), fmt % args)
+
+    # -- helpers ----------------------------------------------------------
+
+    def _send(self, code: int, payload: Any) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_body(self) -> Dict[str, Any]:
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length)
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            raise ValueError("request body is not valid JSON")
+        if not isinstance(data, dict):
+            raise ValueError("request body must be a JSON object")
+        return data
+
+    def _dispatch(self, action: str, params: Dict[str, Any], query: Dict[str, Any]) -> None:
+        server = self.server  # type: ignore[assignment]
+        if action == "get":
+            # /reddigg/get?path=/r/emacs.json?count=5 : the whole reddit
+            # path (including its own query) arrives as one `path` value.
+            params.setdefault("path", query.get("path", ""))
+        elif action in {"ping", "session"}:
+            pass
+
+        async def _run() -> Any:
+            return await server.bridge.call(action, params)
+
+        try:
+            fut = asyncio.run_coroutine_threadsafe(_run(), server.loop)
+            result = fut.result(timeout=server.timeout + 5)
+        except ValueError as exc:
+            self._send(400, {"error": str(exc)})
+            return
+        except NoClientError as exc:
+            self._send(503, {"error": str(exc)})
+            return
+        except TimeoutError as exc:
+            self._send(504, {"error": str(exc)})
+            return
+        except ReddiggError as exc:
+            self._send(502, {"error": str(exc)})
+            return
+        self._send(200, {"ok": True, "result": result})
+
+    # -- verbs ------------------------------------------------------------
+
+    def do_GET(self) -> None:  # noqa: N802 - http.server API
+        parsed = urlparse(self.path)
+        action = _route(parsed.path)
+        if action is None:
+            self._send(404, {"error": "not found"})
+            return
+        query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+        self._dispatch(action, {}, query)
+
+    def do_POST(self) -> None:  # noqa: N802 - http.server API
+        parsed = urlparse(self.path)
+        action = _route(parsed.path)
+        if action is None:
+            self._send(404, {"error": "not found"})
+            return
+        try:
+            params = self._read_body()
+        except ValueError as exc:
+            self._send(400, {"error": str(exc)})
+            return
+        query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+        self._dispatch(action, params, query)
+
+
+class RESTServer:
+    """Serves the :class:`Bridge` CRUD API over HTTP on a worker thread.
+
+    ``ThreadingHTTPServer`` is not asyncio-aware, so it is run in a
+    daemon thread and each request is marshalled back onto the event
+    loop that owns the bridge (``loop``) with
+    ``asyncio.run_coroutine_threadsafe``.
+    """
+
+    def __init__(
+        self,
+        bridge: Bridge,
+        loop: asyncio.AbstractEventLoop,
+        host: str = DEFAULT_HOST,
+        port: int = DEFAULT_REST_PORT,
+        timeout: float = 30.0,
+    ) -> None:
+        self.bridge = bridge
+        self.loop = loop
+        self.timeout = timeout
+        self._httpd = ThreadingHTTPServer((host, port), _RESTHandler)
+        self._httpd.bridge = bridge  # type: ignore[attr-defined]
+        self._httpd.loop = loop  # type: ignore[attr-defined]
+        self._httpd.timeout = timeout  # type: ignore[attr-defined]
+        self._thread = threading.Thread(
+            target=self._httpd.serve_forever,
+            name="reddigg-rest",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+        log.info(
+            "reddigg rest server listening on http://%s:%d%s",
+            *self._httpd.server_address[:2],
+            REST_ROOT,
+        )
+
+    def stop(self) -> None:
+        self._httpd.shutdown()
+        self._httpd.server_close()
+
+
+# ---------------------------------------------------------------------------
 # optional demo REPL: drive reddit from the terminal
 # ---------------------------------------------------------------------------
 
@@ -388,12 +553,25 @@ async def _repl(bridge: Bridge) -> None:
 async def amain(args: argparse.Namespace) -> None:
     bridge = Bridge()
     server_task = asyncio.create_task(serve(bridge, args.host, args.port))
+
+    rest: Optional[RESTServer] = None
+    if not args.no_rest:
+        rest = RESTServer(
+            bridge,
+            asyncio.get_running_loop(),
+            host=args.host,
+            port=args.rest_port,
+        )
+        rest.start()
+
     try:
         if args.repl:
             await _repl(bridge)
         else:
             await server_task
     finally:
+        if rest is not None:
+            rest.stop()
         server_task.cancel()
 
 
@@ -401,6 +579,17 @@ def main(argv: Optional[list] = None) -> None:
     parser = argparse.ArgumentParser(description="reddigg websocket bridge server")
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument(
+        "--rest-port",
+        type=int,
+        default=DEFAULT_REST_PORT,
+        help=f"port for the HTTP/REST API (default {DEFAULT_REST_PORT})",
+    )
+    parser.add_argument(
+        "--no-rest",
+        action="store_true",
+        help="do not start the HTTP/REST API",
+    )
     parser.add_argument(
         "--repl",
         action="store_true",
