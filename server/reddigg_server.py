@@ -1,0 +1,425 @@
+#!/usr/bin/env python3
+"""reddigg websocket server.
+
+This is the Python half of the reddigg browser bridge.  It owns a
+websocket connection to one or more reddit tabs running
+``userscript/reddigg-ws.user.js`` and exposes a small CRUD API to
+whatever wants to drive reddit (Emacs, curl, another script...).
+
+The browser tab is the only thing that can actually talk to reddit
+with the user's real, logged-in session, so this server never touches
+reddit itself: it just relays typed requests to the tab and returns
+the JSON the tab produced.  That mirrors reddigg.el's browser-gt path
+(``EVAL_IN_ACTIVE_TAB`` + same-origin ``fetch``), except the transport
+is a websocket on localhost:1979 instead of browser-gt.
+
+Protocol (JSON, one object per websocket message)
+-------------------------------------------------
+
+server -> page (request)::
+
+    {"id": "<uuid>", "action": "get|session|ping|vote|comment|edit|
+                                delete|submit", "params": {...}}
+
+page -> server (response)::
+
+    {"id": "<uuid>", "ok": true,  "result": <json>}
+    {"id": "<uuid>", "ok": false, "error": "message"}
+
+page -> server (unsolicited, on connect and every 20s)::
+
+    {"type": "hello", "url": ..., "user": ..., "modhash": ...}
+
+The server multiplexes all connected tabs through one request/response
+coroutine (:meth:`Bridge.call`).  If more than one tab is connected,
+the most recently-hello'd one is used by default; pass ``client`` to
+pick a specific connection.
+
+Usage
+-----
+
+    python3 server/reddigg_server.py            # listen on 127.0.0.1:1979
+    python3 server/reddigg_server.py --port 1979 --host 127.0.0.1
+
+As a library::
+
+    from reddigg_server import Bridge, serve
+    bridge = Bridge()
+    asyncio.create_task(serve(bridge, host="127.0.0.1", port=1979))
+    data = await bridge.call("get", {"path": "/r/emacs.json?count=25"})
+    await bridge.call("vote", {"id": "t3_abc", "dir": 1})
+    await bridge.call("comment", {"parent": "t3_abc", "text": "hi"})
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import logging
+import time
+import uuid
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional
+
+import websockets
+from websockets.server import WebSocketServerProtocol
+
+log = logging.getLogger("reddigg")
+
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 1979
+
+# Actions the userscript knows how to perform.  Kept in sync with
+# ``userscript/reddigg-ws.user.js``.
+ACTIONS = {
+    "ping",
+    "session",
+    "get",
+    "vote",
+    "comment",
+    "edit",
+    "delete",
+    "submit",
+}
+
+
+class ReddiggError(RuntimeError):
+    """Raised when a relayed action fails on the browser side."""
+
+
+class NoClientError(ReddiggError):
+    """Raised when a request is made but no reddit tab is connected."""
+
+
+class TimeoutError(ReddiggError):  # noqa: A001 - intentional public name
+    """Raised when the browser does not answer in time."""
+
+
+@dataclass
+class Client:
+    """A single connected reddit tab."""
+
+    ws: WebSocketServerProtocol
+    id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
+    url: Optional[str] = None
+    user: Optional[str] = None
+    modhash: Optional[str] = None
+    last_seen: float = field(default_factory=time.time)
+
+    def describe(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "url": self.url,
+            "user": self.user,
+            "logged_in": bool(self.user),
+        }
+
+
+class Bridge:
+    """Multiplexes action requests over the connected reddit tabs.
+
+    One :class:`Bridge` may have many tabs connected.  Requests are sent
+    to a chosen tab (most-recent by default) and awaited by ``id``.
+    """
+
+    def __init__(self) -> None:
+        self._clients: Dict[str, Client] = {}
+        self._pending: Dict[str, asyncio.Future] = {}
+        self._default: Optional[str] = None
+        self._lock = asyncio.Lock()
+
+    # -- connection bookkeeping -------------------------------------------
+
+    async def register(self, ws: WebSocketServerProtocol) -> Client:
+        client = Client(ws=ws)
+        async with self._lock:
+            self._clients[client.id] = client
+            self._default = client.id
+        log.info("client %s connected (%d total)", client.id, len(self._clients))
+        return client
+
+    async def unregister(self, client: Client) -> None:
+        async with self._lock:
+            self._clients.pop(client.id, None)
+            if self._default == client.id:
+                self._default = next(iter(self._clients), None)
+        log.info("client %s disconnected (%d left)", client.id, len(self._clients))
+
+    def clients(self):
+        """Snapshot of connected tabs."""
+        return list(self._clients.values())
+
+    def default_client(self) -> Optional[Client]:
+        if self._default and self._default in self._clients:
+            return self._clients[self._default]
+        return next(iter(self._clients.values()), None)
+
+    # -- message handling --------------------------------------------------
+
+    async def on_message(self, client: Client, raw: str) -> None:
+        try:
+            msg = json.loads(raw)
+        except (ValueError, TypeError):
+            log.warning("client %s sent non-JSON: %r", client.id, raw[:200])
+            return
+
+        # Unsolicited "hello" keeps our view of the tab fresh.
+        if msg.get("type") == "hello":
+            client.url = msg.get("url")
+            client.user = msg.get("user")
+            client.modhash = msg.get("modhash")
+            client.last_seen = time.time()
+            log.debug("hello from %s: user=%s url=%s", client.id, client.user, client.url)
+            return
+
+        req_id = msg.get("id")
+        if not req_id:
+            log.warning("client %s sent message without id: %r", client.id, msg)
+            return
+
+        fut = self._pending.pop(req_id, None)
+        if fut is None or fut.done():
+            log.debug("late/unknown response id=%s from %s", req_id, client.id)
+            return
+        if msg.get("ok"):
+            fut.set_result(msg.get("result"))
+        else:
+            fut.set_exception(ReddiggError(msg.get("error") or "unknown browser error"))
+
+    # -- request/response --------------------------------------------------
+
+    async def call(
+        self,
+        action: str,
+        params: Optional[Dict[str, Any]] = None,
+        *,
+        client: Optional[str] = None,
+        timeout: float = 30.0,
+    ) -> Any:
+        """Send ACTION with PARAMS to a tab and return its JSON result.
+
+        Raises :class:`NoClientError`, :class:`TimeoutError`, or
+        :class:`ReddiggError` (from the browser) as appropriate.
+        """
+        if action not in ACTIONS:
+            raise ValueError(f"unknown action: {action!r} (expected one of {sorted(ACTIONS)})")
+
+        if client is not None:
+            target = self._clients.get(client)
+            if target is None:
+                raise NoClientError(f"no connected client with id {client!r}")
+        else:
+            target = self.default_client()
+        if target is None:
+            raise NoClientError(
+                "no reddit tab is connected; open old.reddit.com with the "
+                "reddigg-ws userscript enabled"
+            )
+
+        req_id = uuid.uuid4().hex
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._pending[req_id] = fut
+
+        payload = {"id": req_id, "action": action, "params": params or {}}
+        try:
+            await target.ws.send(json.dumps(payload))
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(
+                f"timed out after {timeout}s waiting for {action} on client {target.id}"
+            ) from exc
+        finally:
+            self._pending.pop(req_id, None)
+
+    # -- convenience wrappers (the CRUD API) -------------------------------
+
+    async def ping(self, **kw) -> Any:
+        return await self.call("ping", {}, **kw)
+
+    async def session(self, **kw) -> Any:
+        """Return {"modhash": ..., "user": ...} from the tab."""
+        return await self.call("session", {}, **kw)
+
+    async def get(self, path: str, **kw) -> Any:
+        """GET a reddit JSON path (e.g. ``/r/emacs.json?count=25``)."""
+        return await self.call("get", {"path": path}, **kw)
+
+    async def vote(self, thing_id: str, direction: int, **kw) -> Any:
+        """Vote on THING_ID: direction 1 up, -1 down, 0 clear."""
+        return await self.call("vote", {"id": thing_id, "dir": direction}, **kw)
+
+    async def comment(self, parent: str, text: str, **kw) -> Any:
+        """Reply to PARENT (a fullname like ``t3_abc``/``t1_abc``) with TEXT."""
+        return await self.call("comment", {"parent": parent, "text": text}, **kw)
+
+    async def edit(self, thing_id: str, text: str, **kw) -> Any:
+        """Replace the body of THING_ID with TEXT."""
+        return await self.call("edit", {"id": thing_id, "text": text}, **kw)
+
+    async def delete(self, thing_id: str, **kw) -> Any:
+        """Delete THING_ID (post or comment)."""
+        return await self.call("delete", {"id": thing_id}, **kw)
+
+    async def submit(
+        self,
+        subreddit: str,
+        title: str,
+        *,
+        kind: str = "self",
+        text: str = "",
+        url: str = "",
+        **kw,
+    ) -> Any:
+        """Create a submission in SUBREDDIT.
+
+        KIND is ``"self"`` (text post, uses TEXT) or ``"link"``
+        (link post, uses URL).
+        """
+        return await self.call(
+            "submit",
+            {
+                "subreddit": subreddit,
+                "title": title,
+                "kind": kind,
+                "text": text,
+                "url": url,
+            },
+            **kw,
+        )
+
+
+# ---------------------------------------------------------------------------
+# websocket server glue
+# ---------------------------------------------------------------------------
+
+
+async def handler(bridge: Bridge, ws: WebSocketServerProtocol, path: str = "") -> None:
+    client = await bridge.register(ws)
+    try:
+        async for raw in ws:
+            await bridge.on_message(client, raw)
+    except websockets.ConnectionClosed:
+        pass
+    finally:
+        await bridge.unregister(client)
+
+
+async def serve(
+    bridge: Optional[Bridge] = None,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> None:
+    """Run the websocket server until cancelled."""
+    bridge = bridge or Bridge()
+    async with websockets.serve(lambda ws, path: handler(bridge, ws, path), host, port):
+        log.info("reddigg ws server listening on ws://%s:%d", host, port)
+        await asyncio.Future()  # run forever
+
+
+# ---------------------------------------------------------------------------
+# optional demo REPL: drive reddit from the terminal
+# ---------------------------------------------------------------------------
+
+
+async def _repl(bridge: Bridge) -> None:
+    """Tiny interactive driver so you can poke the API by hand."""
+    help_text = """commands:
+  ping
+  session
+  get <path>                 e.g. get /r/emacs.json?count=5
+  vote <id> <dir>            dir = 1 | -1 | 0
+  comment <parent> <text>
+  edit <id> <text>
+  delete <id>
+  submit <sr> <title> [url]   (with a url -> link post)
+  clients
+  quit
+"""
+    print(help_text)
+    while True:
+        try:
+            line = await asyncio.to_thread(input, "reddigg> ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        line = line.strip()
+        if not line:
+            continue
+        if line in {"quit", "exit", "q"}:
+            return
+        if line == "help":
+            print(help_text)
+            continue
+        if line == "clients":
+            for c in bridge.clients():
+                print(" ", c.describe())
+            continue
+
+        parts = line.split(maxsplit=3)
+        cmd = parts[0]
+        try:
+            if cmd == "ping":
+                print(await bridge.ping())
+            elif cmd == "session":
+                print(await bridge.session())
+            elif cmd == "get":
+                print(json.dumps(await bridge.get(parts[1]), indent=2)[:2000])
+            elif cmd == "vote":
+                print(await bridge.vote(parts[1], int(parts[2])))
+            elif cmd == "comment":
+                print(await bridge.comment(parts[1], parts[2]))
+            elif cmd == "edit":
+                print(await bridge.edit(parts[1], parts[2]))
+            elif cmd == "delete":
+                print(await bridge.delete(parts[1]))
+            elif cmd == "submit":
+                sr, title = parts[1], parts[2]
+                url = parts[3] if len(parts) > 3 else ""
+                kind = "link" if url else "self"
+                print(await bridge.submit(sr, title, kind=kind, text=title if not url else "", url=url))
+            else:
+                print("unknown command; try 'help'")
+        except (ReddiggError, IndexError, ValueError) as exc:
+            print(f"error: {exc}")
+
+
+async def amain(args: argparse.Namespace) -> None:
+    bridge = Bridge()
+    server_task = asyncio.create_task(serve(bridge, args.host, args.port))
+    try:
+        if args.repl:
+            await _repl(bridge)
+        else:
+            await server_task
+    finally:
+        server_task.cancel()
+
+
+def main(argv: Optional[list] = None) -> None:
+    parser = argparse.ArgumentParser(description="reddigg websocket bridge server")
+    parser.add_argument("--host", default=DEFAULT_HOST)
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument(
+        "--repl",
+        action="store_true",
+        help="also start an interactive prompt to drive the API by hand",
+    )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", help="debug logging"
+    )
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    try:
+        asyncio.run(amain(args))
+    except KeyboardInterrupt:
+        log.info("shutting down")
+
+
+if __name__ == "__main__":
+    main()

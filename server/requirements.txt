@@ -1,0 +1,11 @@
+# reddigg websocket bridge server
+#
+# websockets is the only runtime dependency.  It is the de-facto
+# standard asyncio websocket library and has no heavy transitive deps.
+#
+# Install:
+#     python3 -m pip install -r server/requirements.txt
+# or, for an isolated environment:
+#     python3 -m venv .venv && . .venv/bin/activate
+#     pip install -r server/requirements.txt
+websockets>=11,<14
