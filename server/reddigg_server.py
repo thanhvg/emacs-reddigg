@@ -13,6 +13,9 @@ the JSON the tab produced.  That mirrors reddigg.el's browser-gt path
 (``EVAL_IN_ACTIVE_TAB`` + same-origin ``fetch``), except the transport
 is a websocket on localhost:1979 instead of browser-gt.
 
+Requires ``websockets`` >= 10.1 (works with both the legacy and the
+new asyncio API, including 13/14/15).
+
 Protocol (JSON, one object per websocket message)
 -------------------------------------------------
 
@@ -64,10 +67,9 @@ import uuid
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, urlparse
 
 import websockets
-from websockets.server import WebSocketServerProtocol
 
 log = logging.getLogger("reddigg")
 
@@ -106,7 +108,7 @@ class TimeoutError(ReddiggError):  # noqa: A001 - intentional public name
 class Client:
     """A single connected reddit tab."""
 
-    ws: WebSocketServerProtocol
+    ws: Any  # a websockets connection (legacy or new asyncio API)
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     url: Optional[str] = None
     user: Optional[str] = None
@@ -137,7 +139,7 @@ class Bridge:
 
     # -- connection bookkeeping -------------------------------------------
 
-    async def register(self, ws: WebSocketServerProtocol) -> Client:
+    async def register(self, ws: Any) -> Client:
         client = Client(ws=ws)
         async with self._lock:
             self._clients[client.id] = client
@@ -301,7 +303,7 @@ class Bridge:
 # ---------------------------------------------------------------------------
 
 
-async def handler(bridge: Bridge, ws: WebSocketServerProtocol, path: str = "") -> None:
+async def handler(bridge: Bridge, ws: Any) -> None:
     client = await bridge.register(ws)
     try:
         async for raw in ws:
@@ -319,7 +321,14 @@ async def serve(
 ) -> None:
     """Run the websocket server until cancelled."""
     bridge = bridge or Bridge()
-    async with websockets.serve(lambda ws, path: handler(bridge, ws, path), host, port):
+
+    # One-argument handler: accepted by the legacy API (websockets >= 10.1)
+    # and required by the new asyncio API (websockets >= 13), where the
+    # old ``(ws, path)`` signature no longer works.
+    async def ws_handler(ws: Any) -> None:
+        await handler(bridge, ws)
+
+    async with websockets.serve(ws_handler, host, port):
         log.info("reddigg ws server listening on ws://%s:%d", host, port)
         await asyncio.Future()  # run forever
 
@@ -328,13 +337,13 @@ async def serve(
 # HTTP/REST glue
 # ---------------------------------------------------------------------------
 
-def _route(path: str) -> Optional[tuple]:
-    """Map an HTTP path to ``(action, query-only?)``.
+def _route(path: str) -> Optional[str]:
+    """Map an HTTP path to a bridge action name.
 
-    Returns the bridge action name for ``GET /reddigg/<action>``, or
+    Returns the bridge action name for ``/reddigg/<action>``, or
     ``None`` if the path is not a known REST route.  All state-changing
     verbs take their arguments as JSON in the request body, so only the
-    read-only ``ping``/``session``/``get`` are offered via GET.
+    read-only ``ping``/``session``/``get`` are meaningful via GET.
     """
     if not path.startswith(REST_ROOT + "/"):
         return None
@@ -391,15 +400,23 @@ class _RESTHandler(BaseHTTPRequestHandler):
             # /reddigg/get?path=/r/emacs.json?count=5 : the whole reddit
             # path (including its own query) arrives as one `path` value.
             params.setdefault("path", query.get("path", ""))
-        elif action in {"ping", "session"}:
-            pass
 
         async def _run() -> Any:
-            return await server.bridge.call(action, params)
+            return await server.bridge.call(action, params, timeout=server.timeout)
 
+        fut = asyncio.run_coroutine_threadsafe(_run(), server.loop)
         try:
-            fut = asyncio.run_coroutine_threadsafe(_run(), server.loop)
+            # Slightly longer than the bridge's own timeout, so the bridge
+            # normally reports the timeout itself (as our TimeoutError).
             result = fut.result(timeout=server.timeout + 5)
+        except concurrent.futures.TimeoutError:
+            # Backstop: the coroutine did not finish even after the bridge
+            # timeout.  This is a *different* class from the module's own
+            # TimeoutError below, so it needs its own handler -- otherwise
+            # the worker thread dies and the client never gets a reply.
+            fut.cancel()
+            self._send(504, {"error": f"timed out waiting for {action}"})
+            return
         except ValueError as exc:
             self._send(400, {"error": str(exc)})
             return
@@ -411,6 +428,10 @@ class _RESTHandler(BaseHTTPRequestHandler):
             return
         except ReddiggError as exc:
             self._send(502, {"error": str(exc)})
+            return
+        except Exception as exc:  # noqa: BLE001 - never leave the client hanging
+            log.exception("unexpected error handling %s", action)
+            self._send(500, {"error": f"internal error: {exc}"})
             return
         self._send(200, {"ok": True, "result": result})
 

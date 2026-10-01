@@ -132,3 +132,5 @@ elisp:(reddigg-view-sub "emacs")
 elisp:(reddigg--view-sub "experienceddevs" :sort 'top :scope 'year)
 
 * TODO minor mode
+* TODO use async calls for elisp 
+* TODO extract python and monkey to standalone project
