@@ -1,11 +1,10 @@
 ;;; reddigg.el --- A reader for redditt -*- lexical-binding: t; -*-
-
 ;; Copyright (C) 2021  Thanh Vuong
 
 ;; Author: Thanh Vuong <thanhvg@gmail.com>
 ;; URL: https://github.com/thanhvg/emacs-reddigg
-;; Package-Requires: ((emacs "26.3") (promise "1.1") (ht "2.3") (org "9.2"))
-;; Version: 0.7.1
+;; Package-Requires: ((emacs "26.3") (promise "1.1") (ht "2.3") (org "9.2") (json "1.4"))
+;; Version: 0.8.0
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -25,18 +24,17 @@
 ;;
 ;; Reddit now requires a logged-in, browser-driven session for its
 ;; JSON endpoints, so reddigg no longer talks to old.reddit.com
-;; directly with `url-retrieve'.  Instead it uses the `browser-gt'
-;; package (https://github.com/dmgerman/browser-gt) to run the fetch
-;; *inside* an already-open, already-authenticated reddit tab in
-;; your real browser, and reads the resulting JSON text back into
-;; Emacs.  You must:
-;;   1. Have `browser-gt' set up and running (see its README) with both
-;;      the Emacs side (`browser-gt-start') and the browser extension
-;;      loaded and connected.
-;;   2. Be logged into old.reddit.com in that browser.
-;; reddigg will look for an already-open reddit tab; if it can't
-;; find one it will offer to open old.reddit.com for you and wait
-;; for it to finish loading before continuing.
+;; directly.  Instead it talks to a small local Python server (see
+;; server/reddigg_server.py) over a simple HTTP/REST API.  That server
+;; relays requests to a reddit tab running the reddigg userscript,
+;; which is the only thing with the user's real, logged-in session.
+;; You must:
+;;   1. Run the server:  python3 server/reddigg_server.py
+;;   2. Load userscript/reddigg-ws.user.js in your browser and be
+;;      logged into old.reddit.com there.
+;; See `reddigg-server-url' to point Emacs at a non-default host/port,
+;; and `reddigg-ping' to check that the whole chain
+;; (Emacs -> server -> browser tab) is working.
 ;;
 ;; Buffers:
 ;; There are three buffers which are on org-mode. They show links and elisp
@@ -61,9 +59,16 @@
 ;; https://old.reddit.com/r/emacs/comments/lfww57/weekly_tipstricketc_thread/)
 ;; and show it.
 ;;
-;; * Remarks
-;; This mode only lets you view reddit. For a complete interaction with reddit check
-;; out md4rd at https://github.com/ahungry/md4rd.
+;; reddigg-ping: check the server and the browser tab are reachable.
+;;
+;; reddigg-refresh-session: re-read the logged-in username from the tab.
+;;
+;; * Interaction (in the generated buffers, `reddigg-view-mode')
+;; C-c C-v u / d / 0   upvote / downvote / clear vote
+;; C-c C-v r           reply
+;; C-c C-v e           edit your own post/comment
+;; C-c C-v x           delete your own post/comment
+;; `reddigg-submit-post' creates a new submission.
 
 ;;; Code:
 
@@ -73,10 +78,8 @@
 (require 'ht)
 (require 'org)
 (require 'json)
-;; Soft-required: only needed once `reddigg-start' / a fetch actually
-;; runs, but we want a clear error message rather than a void-function
-;; error if it's missing.
-(require 'browser-gt nil t)
+(require 'url)
+(require 'url-http)
 
 (defgroup reddigg nil
   "Search and read stackoverflow and sisters's sites."
@@ -88,30 +91,22 @@
   :type 'list
   :group 'reddigg)
 
-(defcustom reddigg-browser-gt-client nil
-  "Browser client name (\"chrome\" or \"firefox\") to address via browser-gt.
-Leave nil to let browser-gt pick automatically; only required when more
-than one browser is connected to Emacs at the same time."
-  :type '(choice (const :tag "Auto" nil) string)
-  :group 'reddigg)
-
-(defcustom reddigg-reddit-host-regexp "\\(?:old\\.\\)?reddit\\.com"
-  "Regexp matched against a tab's URL to recognise it as a reddit tab."
-  :type 'regexp
-  :group 'reddigg)
-
-(defcustom reddigg-reddit-open-url "https://old.reddit.com"
-  "URL to open when no reddit tab is found and the user agrees to open one."
+(defcustom reddigg-server-url "http://127.0.0.1:1980/reddigg"
+  "Base URL of the reddigg HTTP/REST server.
+The server (see server/reddigg_server.py) relays requests to a reddit
+tab running userscript/reddigg-ws.user.js.  The default matches the
+server's default --rest-port (1980)."
   :type 'string
   :group 'reddigg)
 
-(defcustom reddigg-browser-gt-tab-wait-timeout 20
-  "Seconds to wait for a freshly opened reddit tab to finish loading."
+(defcustom reddigg-request-timeout 35
+  "Seconds to wait for a single reddigg HTTP request to complete."
   :type 'number
   :group 'reddigg)
 
 (defvar reddigg--modhash nil
-  "Cached CSRF modhash scraped from the reddit tab.")
+  "Cached CSRF modhash scraped from the reddit tab (informational only;
+the server/userscript attaches the modhash to state-changing requests).")
 
 (defvar reddigg--current-user nil
   "Cached logged-in reddit username, scraped from the reddit tab.")
@@ -142,25 +137,34 @@ for JSON false."
   (reddigg--parse-json-string
    (buffer-substring-no-properties (point) (point-max))))
 
-(defconst reddigg--sub-url
-  "https://old.reddit.com/r/%s.json?count=25"
-  "Sub reddit template.")
+(defun reddigg--reason-string (reason)
+  "Turn a promise rejection REASON into a printable string.
+Reasons are either plain strings (from the HTTP layer) or Lisp error
+objects such as (error \"msg\") or (user-error \"msg\")."
+  (cond ((stringp reason) reason)
+        ((and (consp reason) (symbolp (car reason)))
+         (error-message-string reason))
+        (t (format "%s" reason))))
 
-(defconst reddigg--sub-view-sort-url
-  "https://old.reddit.com/r/%s/%s.json?count=25"
-  "Sub reddit template for new and rising.")
+(defconst reddigg--sub-path
+  "/r/%s.json?count=25"
+  "Sub reddit path template (origin supplied by the server).")
 
-(defconst reddigg--sub-view-sort-scope-url
-  "https://old.reddit.com/r/%s/%s.json?count=25&sort=%s&t=%s"
-  "Sub reddit template for top and controversial.")
+(defconst reddigg--sub-view-sort-path
+  "/r/%s/%s.json?count=25"
+  "Sub reddit path template for new and rising.")
 
-(defconst reddigg--cmt-url
-  "https://old.reddit.com/%s.json"
-  "Comment link template.")
+(defconst reddigg--sub-view-sort-scope-path
+  "/r/%s/%s.json?count=25&sort=%s&t=%s"
+  "Sub reddit path template for top and controversial.")
 
-(defconst reddigg--cmt-more-url
-  "https://api.reddit.com/api/morechildren?api_type=json&link_id=%s&children=%s"
-  "More comment link template.")
+(defconst reddigg--cmt-path
+  "/%s.json"
+  "Comment link path template.")
+
+(defconst reddigg--cmt-more-path
+  "/api/morechildren?api_type=json&link_id=%s&children=%s"
+  "More comment link path template.")
 
 (defconst reddigg--template-sub "[[elisp:(reddigg-view-sub \"%s\")][%s]]\n"
   "Template string for main.")
@@ -192,224 +196,180 @@ for JSON false."
 (defvar-local reddigg--cmt-list-id nil
   "ID/name of the current comment list.")
 
+;;; --- HTTP transport to the local reddigg server --------------------------
+;;
+;; All reddit access goes through the local Python server (see
+;; `reddigg-server-url'), which relays each request to the reddit tab
+;; running the reddigg userscript -- the only thing with a real,
+;; logged-in session.  The server exposes a small REST API:
+;;
+;;   GET  /reddigg/ping                   -> {"ok":true,"result":...}
+;;   GET  /reddigg/session                -> {"ok":true,"result":{modhash,user}}
+;;   GET  /reddigg/get?path=<reddit path> -> {"ok":true,"result":<json>}
+;;   POST /reddigg/vote     {"id","dir"}
+;;   POST /reddigg/comment  {"parent","text"}
+;;   POST /reddigg/edit     {"id","text"}
+;;   POST /reddigg/delete   {"id"}
+;;   POST /reddigg/submit   {"subreddit","title","kind","text","url"}
+;;
+;; Every reply is either {"ok":true,"result":...} or {"error":"..."}
+;; (with a 4xx/5xx status on failure).
+
+(defun reddigg--url-encode (s)
+  "Percent-encode string S for use as a URL query value."
+  (url-hexify-string s))
+
+(defun reddigg--http-request (method url &optional body)
+  "Perform a synchronous HTTP request and promise the parsed result.
+METHOD is \"GET\" or \"POST\".  URL is the full request URL.  BODY,
+when non-nil, is a hash-table/alist to send as a JSON POST body.
+The promise resolves to the server's `result' value, or rejects with
+a string carrying the server's message on failure."
+  (promise-new
+   (lambda (resolve reject)
+     (condition-case err
+         (let* ((url-request-method method)
+                (url-request-extra-headers
+                 (when body '(("Content-Type" . "application/json"))))
+                (url-request-data
+                 (when body (encode-coding-string (json-encode body) 'utf-8)))
+                (buf (url-retrieve-synchronously url t t
+                                                 reddigg-request-timeout)))
+           (if (not buf)
+               (funcall reject
+                        "reddigg: no response from server (is it running, or did the request time out?)")
+             (unwind-protect
+                 (with-current-buffer buf
+                   (goto-char (point-min))
+                   (let* ((status (and (looking-at "HTTP/[0-9.]+ \\([0-9]+\\)")
+                                       (string-to-number (match-string 1))))
+                          ;; The body starts after the blank line that ends
+                          ;; the headers; it is UTF-8 bytes in a unibyte buffer.
+                          (data (and (re-search-forward "\r?\n\r?\n" nil t)
+                                     (condition-case nil
+                                         (reddigg--parse-json-string
+                                          (decode-coding-string
+                                           (buffer-substring-no-properties
+                                            (point) (point-max))
+                                           'utf-8))
+                                       (error nil)))))
+                     (if (and status (>= status 200) (< status 300)
+                              (hash-table-p data))
+                         (funcall resolve (gethash "result" data))
+                       (funcall reject
+                                (or (and (hash-table-p data)
+                                         (gethash "error" data))
+                                    (format "reddigg: HTTP %s from server"
+                                            (or status "?")))))))
+               (kill-buffer buf))))
+       (error (funcall reject
+                       (format "reddigg: request to %s failed: %s"
+                               url (error-message-string err))))))))
+
+(defun reddigg--reddigg-get (path)
+  "Promise the reddit JSON at reddit PATH (e.g. \"/r/emacs.json\")."
+  (reddigg--http-request
+   "GET"
+   (format "%s/get?path=%s" reddigg-server-url (reddigg--url-encode path))))
+
+(defun reddigg--reddigg-post (action params)
+  "Promise the result of POSTing PARAMS to server ACTION.
+PARAMS is an alist of (\"name\" . value) or a hash-table; it is sent
+as a JSON object body."
+  (reddigg--http-request
+   "POST"
+   (format "%s/%s" reddigg-server-url action)
+   (if (hash-table-p params) params (ht<-alist params))))
+
+;;; --- reading: posts and comments -------------------------------------------
+
 (cl-defun reddigg--promise-posts (sub &key after before sort scope)
   "Promise SUB post list with keywords.
 AFTER: fetch post after name.
 BEFORE: fetch posts before name.
 SORT: top, hot, best, rising, controversial.
 SCOPE: hour, day, week, year, all."
-  (reddigg--promise-json
-   ;; create the url
+  (reddigg--reddigg-get
+   ;; create the reddit path (the server prepends the origin)
    (concat
     (cond
      ((or (eq sort 'new )
           (eq sort 'rising))
-      (format reddigg--sub-view-sort-url sub sort))
+      (format reddigg--sub-view-sort-path sub sort))
      ((or (eq sort 'top )
           (eq sort 'controversial))
-      (format reddigg--sub-view-sort-scope-url sub sort sort scope))
-     (t (format reddigg--sub-url sub sort sort)))
+      (format reddigg--sub-view-sort-scope-path sub sort sort scope))
+     (t (format reddigg--sub-path sub)))
     (when after
       (concat "&after=" after))
     (when before
       (concat "&before=" before)))))
 
+(defun reddigg--normalize-cmt-path (cmt)
+  "Reduce CMT to a bare path such as \"r/emacs/comments/abc/title\".
+CMT may be a full reddit URL, a permalink with leading/trailing
+slashes (as reddit returns them), or an already-bare path.  The
+leading slash matters: the server resolves the path against the
+reddit origin, so a stray \"//\" would be read as a host."
+  (let* ((p (replace-regexp-in-string "\\`https?://[^/]+/" "" cmt))
+         (p (replace-regexp-in-string "[?#].*\\'" "" p))
+         (p (replace-regexp-in-string "\\`/+\\|/+\\'" "" p))
+         (p (replace-regexp-in-string "\\.json\\'" "" p)))
+    p))
+
 (defun reddigg--promise-comments (cmt)
   "Promise CMT list."
-  (reddigg--promise-json (format reddigg--cmt-url cmt)))
+  (reddigg--reddigg-get
+   (format reddigg--cmt-path (reddigg--normalize-cmt-path cmt))))
 
 (defun reddigg--promise-more-comments (children)
   "Promise more comment list for CHILDREN."
-  (reddigg--promise-json (format reddigg--cmt-more-url
-                                 reddigg--cmt-list-id
-                                 children)))
+  (reddigg--reddigg-get
+   (format reddigg--cmt-more-path reddigg--cmt-list-id children)))
 
-;;; --- JSON fetching via browser-gt ------------------------------------------
+;;; --- health check -----------------------------------------------------------
+
+;;;###autoload
+(defun reddigg-ping ()
+  "Check that the reddigg server is up and a reddit tab is connected."
+  (interactive)
+  (promise-chain (reddigg--http-request
+                  "GET" (format "%s/ping" reddigg-server-url))
+    (then (lambda (_result)
+            (message "reddigg: server and browser tab are reachable")))
+    (promise-catch (lambda (reason)
+                     (message "reddigg: ping failed: %s"
+                              (reddigg--reason-string reason))))))
+
+;;; --- session info -------------------------------------------------------
 ;;
-;; Reddit's JSON endpoints now require a real, logged-in browser
-;; session, so all fetches go through `browser-gt', running inside an
-;; open reddit tab.
-
-(defun reddigg--browser-gt-plist-tab-p (x)
-  "Heuristic: does X look like a single tab plist (i.e. has an :id)?"
-  (and (consp x) (plist-member x :id)))
-
-(defun reddigg--browser-gt-as-tab-list (x)
-  "Coerce a browser-gt response X into a list of tab plists.
-
-The exact response envelope for GET_ALL_TABS / OPEN_TAB isn't
-pinned down from the README alone (it's shown both as a bare list
-of tabs and as a `:status'/`:result' plist), so this accepts
-either: a bare list, a vector, a single tab plist, or an envelope
-plist whose payload lives under :tabs, :result, or :tab."
-  (cond
-   ((null x) nil)
-   ((reddigg--browser-gt-plist-tab-p x) (list x))
-   ((vectorp x) (append x nil))
-   ((and (consp x) (plist-member x :status))
-    (reddigg--browser-gt-as-tab-list (or (plist-get x :tabs)
-                                       (plist-get x :result)
-                                       (plist-get x :tab))))
-   ((listp x) x)
-   (t nil)))
-
-(defun reddigg--ensure-browser-gt ()
-  "Signal a clear error if `browser-gt' isn't loaded."
-  (unless (featurep 'browser-gt)
-    (user-error "reddigg: `browser-gt' is not loaded; install it and \
-require it (or add it to your `use-package browser-gt' config) before \
-using reddigg")))
-
-(defun reddigg--find-reddit-tab-id ()
-  "Return the id of an already-open tab that looks like reddit, or nil."
-  (let* ((resp (browser-gt-request "GET_ALL_TABS" nil reddigg-browser-gt-client))
-         (tabs (reddigg--browser-gt-as-tab-list resp))
-         (tab (seq-find (lambda (tb)
-                          (string-match-p reddigg-reddit-host-regexp
-                                          (or (plist-get tb :url) "")))
-                        tabs)))
-    (plist-get tab :id)))
-
-(defun reddigg--tab-ready-p (id)
-  "Non-nil when tab ID exists, is done loading, and is on reddit."
-  (let* ((resp (browser-gt-request "GET_ALL_TABS" nil reddigg-browser-gt-client))
-         (tabs (reddigg--browser-gt-as-tab-list resp))
-         (tab (seq-find (lambda (tb) (equal (plist-get tb :id) id)) tabs)))
-    (and tab
-         (or (null (plist-get tab :status))
-             (equal (plist-get tab :status) "complete"))
-         (string-match-p reddigg-reddit-host-regexp (or (plist-get tab :url) "")))))
-
-(defun reddigg--wait-tab-ready (id)
-  "Block (with `sit-for') until tab ID is ready or we time out."
-  (let ((deadline (+ (float-time) reddigg-browser-gt-tab-wait-timeout)))
-    (while (and (< (float-time) deadline)
-                (not (reddigg--tab-ready-p id)))
-      (sit-for 0.5))
-    (unless (reddigg--tab-ready-p id)
-      (user-error "reddigg: timed out waiting for the reddit tab to finish loading"))))
-
-(defun reddigg--open-reddit-tab-and-wait ()
-  "Ask the user, then open `reddigg-reddit-open-url' and wait for it."
-  (unless (y-or-n-p (format "reddigg: no reddit tab found; open %s now? "
-                            reddigg-reddit-open-url))
-    (user-error "reddigg: open %s in your browser and retry"
-               reddigg-reddit-open-url))
-  (let* ((resp (browser-gt-request "OPEN_TAB" (list :url reddigg-reddit-open-url)
-                                reddigg-browser-gt-client))
-         (tab (car (reddigg--browser-gt-as-tab-list resp)))
-         (id (plist-get tab :id)))
-    (unless id
-      (user-error "reddigg: could not open a reddit tab (response: %S)" resp))
-    (reddigg--wait-tab-ready id)
-    id))
-
-(defun reddigg--reddit-tab-id (&optional prompt-if-missing)
-  "Return the id of a reddit tab, prompting to open one if PROMPT-IF-MISSING."
-  (or (reddigg--find-reddit-tab-id)
-      (when prompt-if-missing
-        (reddigg--open-reddit-tab-and-wait))))
-
-(defun reddigg--fetch-js (url)
-  "JS to run inside the reddit tab: same-origin fetch of URL (so it
-rides along with the tab's own cookies/session), returning the raw
-JSON response body as a string."
-  (let ((json-url (json-encode url)))
-    (format "(async () => {
-  const r = await fetch(%s, { credentials: 'include' });
-  if (!r.ok) throw new Error('reddigg: HTTP ' + r.status + ' for ' + %s);
-  return await r.text();
-})()"
-            json-url json-url)))
-
-(defun reddigg--handle-eval-response (response resolve reject)
-  "Unpack an EVAL_IN_ACTIVE_TAB RESPONSE and RESOLVE/REJECT accordingly."
-  (if (not (equal (plist-get response :status) "ok"))
-      (funcall reject (or (plist-get response :message) response))
-    (let* ((results (plist-get response :result))
-           (first (cond ((vectorp results) (aref results 0))
-                       ((consp results) (car results))
-                       (t results)))
-           (text (plist-get first :result)))
-      (if (not (stringp text))
-          (funcall reject (format "reddigg: unexpected eval result shape: %S" response))
-        (condition-case err
-            (funcall resolve (reddigg--parse-json-string text))
-          (error (funcall reject err)))))))
-
-(defun reddigg--eval-json-promise (code &optional tab-id)
-  "Run JS CODE in a reddit tab (finding/opening one unless TAB-ID is
-given). CODE must return a JSON string. Promise the parsed JSON."
-  (reddigg--ensure-browser-gt)
-  (promise-new
-   (lambda (resolve reject)
-     (condition-case err
-         (let ((id (or tab-id (reddigg--reddit-tab-id t))))
-           (browser-gt-request-async
-            "EVAL_IN_ACTIVE_TAB"
-            (list :tabId id :code code)
-            (lambda (response)
-              (reddigg--handle-eval-response response resolve reject))
-            reddigg-browser-gt-client))
-       (error (funcall reject err))))))
-
-(defun reddigg--promise-json (url)
-  "Promise the JSON at URL, fetched from inside a live reddit tab via browser-gt."
-  (reddigg--eval-json-promise (reddigg--fetch-js url)))
-
-;;; --- CSRF / session info ------------------------------------------------
-;;
-;; Reddit's POST endpoints require a modhash: a CSRF token embedded
-;; in the page itself (window.r.config.modhash on old.reddit.com),
-;; alongside the session cookie the browser already attaches
-;; automatically. The cookie alone proves you're logged in; the
-;; modhash proves the request was actually issued by code running on
-;; reddit's own page (cross-origin script can't read it), which is
-;; what blocks a forged cross-site request. reddit's own "vote"
-;; button reads this same value before submitting -- we're just
-;; doing what it does.
-
-(defun reddigg--session-info-js ()
-  "JS returning {modhash, user} as a JSON string, scraped from the
-loaded reddit page. Tries the legacy `r.config' object first, falls
-back to scraping the DOM in case that object ever goes away."
-  "(() => {
-  let modhash = null, user = null;
-  try {
-    if (typeof r !== 'undefined' && r.config) {
-      modhash = r.config.modhash || null;
-      user = r.config.cur_user || null;
-    }
-  } catch (e) {}
-  if (!modhash) {
-    const el = document.querySelector('input[name=\"uh\"]');
-    if (el) modhash = el.value;
-  }
-  if (!user) {
-    const el = document.querySelector('.user a');
-    if (el) user = el.textContent.trim();
-  }
-  return JSON.stringify({ modhash: modhash, user: user });
-})()")
+;; The local server reports the logged-in user (and modhash) for the
+;; reddit tab it is relaying to; Emacs keeps the username around so it
+;; can tell which entries are the user's own (for edit/delete).
 
 (defun reddigg--promise-session-info (&optional force)
   "Promise (MODHASH . USER). Uses cached values unless FORCE."
-  (if (and (not force) reddigg--modhash reddigg--current-user)
+  (if (and (not force) reddigg--current-user)
       (promise-resolve (cons reddigg--modhash reddigg--current-user))
-    (promise-chain (reddigg--eval-json-promise (reddigg--session-info-js))
+    (promise-chain (reddigg--http-request
+                    "GET" (format "%s/session" reddigg-server-url))
       (then (lambda (data)
-              (let ((modhash (gethash "modhash" data))
-                    (user (gethash "user" data)))
-                (unless (and modhash (> (length modhash) 0))
-                  (error "reddigg: no CSRF modhash found on the reddit tab \
+              (let ((modhash (and (hash-table-p data) (gethash "modhash" data)))
+                    (user (and (hash-table-p data) (gethash "user" data))))
+                (unless (and (stringp user) (> (length user) 0))
+                  (error "reddigg: not logged in on the reddit tab \
 (are you logged into old.reddit.com?)"))
                 (setq reddigg--modhash modhash
                       reddigg--current-user user)
                 (cons modhash user)))))))
 
+(defun reddigg--prefetch-session ()
+  "Warm the session cache in the background, ignoring failures."
+  (promise-catch (reddigg--promise-session-info) #'ignore))
+
 ;;;###autoload
 (defun reddigg-refresh-session ()
-  "Force re-reading the CSRF modhash and username from the reddit tab.
+  "Force re-reading the username from the reddit tab.
 Use this if actions start failing after you log out/in or switch
 accounts in the browser."
   (interactive)
@@ -417,27 +377,10 @@ accounts in the browser."
     (then (lambda (info)
             (message "reddigg: session refreshed (logged in as %s)" (cdr info))))
     (promise-catch (lambda (reason)
-                     (message "reddigg: could not refresh session: %s" reason)))))
+                     (message "reddigg: could not refresh session: %s"
+                              (reddigg--reason-string reason))))))
 
 ;;; --- Generic authenticated POST ------------------------------------------
-
-(defun reddigg--post-js (path fields)
-  "JS that POSTs FIELDS (an elisp alist) to PATH on the current
-origin, same-origin with credentials, and returns the response body
-as a string."
-  (format "(async () => {
-  const params = new URLSearchParams(%s);
-  const r = await fetch(%s, {
-    method: 'POST',
-    credentials: 'include',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: params.toString()
-  });
-  const text = await r.text();
-  if (!r.ok) throw new Error('reddigg: HTTP ' + r.status + ' for ' + %s + ': ' + text);
-  return text;
-})()"
-          (json-encode fields) (json-encode path) (json-encode path)))
 
 (defun reddigg--check-api-errors (data)
   "Signal a readable error if DATA (parsed reddit API JSON) carries
@@ -447,21 +390,18 @@ errors in the {\"json\":{\"errors\":[...]}} envelope; else return DATA."
            (errors (and (hash-table-p json) (gethash "errors" json))))
       (when (and errors (> (length errors) 0))
         (error "reddigg: reddit API error: %s"
-               (mapconcat (lambda (e) (format "%s" (if (>= (length e) 2) (aref e 1) e)))
+               (mapconcat (lambda (e)
+                            (format "%s" (if (and (sequencep e) (>= (length e) 2))
+                                             (elt e 1)
+                                           e)))
                           (append errors nil) "; ")))))
   data)
 
-(defun reddigg--promise-post (path fields)
-  "Promise the parsed JSON result of POSTing FIELDS to PATH (e.g.
-\"/api/vote\") on old.reddit.com, run from inside the reddit tab.
-Automatically attaches the CSRF modhash once session info is known,
-and signals an error if the API reports one."
-  (promise-chain (reddigg--promise-session-info)
-    (then (lambda (info)
-            (let ((full-fields (append fields
-                                        (list (cons "uh" (car info))
-                                              (cons "api_type" "json")))))
-              (reddigg--eval-json-promise (reddigg--post-js path full-fields)))))
+(defun reddigg--promise-post (action fields)
+  "Promise the parsed JSON result of POSTing FIELDS (an alist) to server
+ACTION (e.g. \"vote\").  The browser side attaches the CSRF modhash
+itself; this signals an error if reddit's response reports one."
+  (promise-chain (reddigg--reddigg-post action fields)
     (then #'reddigg--check-api-errors)))
 
 ;;; --- Thing identity (posts/comments) at point ----------------------------
@@ -527,14 +467,15 @@ readable timestamp, or \"unknown\" if EPOCH isn't a number."
 
 ;;; --- Voting ---------------------------------------------------------------
 
-(defconst reddigg--vote-path "https://old.reddit.com/api/vote")
+(defconst reddigg--vote-action "vote"
+  "Server action for voting.  Params: id, dir.")
 
 (defun reddigg--vote (dir)
   "Vote DIR (1, -1, or 0) on the reddigg entry at point."
   (let* ((thing (reddigg--thing-at-point))
          (id (plist-get thing :id))
          (marker (point-marker)))
-    (promise-chain (reddigg--promise-post reddigg--vote-path
+    (promise-chain (reddigg--promise-post reddigg--vote-action
                                           (list (cons "id" id) (cons "dir" dir)))
       (then (lambda (_data)
               (with-current-buffer (marker-buffer marker)
@@ -552,7 +493,8 @@ readable timestamp, or \"unknown\" if EPOCH isn't a number."
                             (if (>= delta 0) "+" "")
                             delta))))))
       (promise-catch (lambda (reason)
-                       (message "reddigg: vote failed: %s" reason))))))
+                       (message "reddigg: vote failed: %s"
+                                (reddigg--reason-string reason)))))))
 
 ;;;###autoload
 (defun reddigg-vote-up ()
@@ -577,11 +519,11 @@ readable timestamp, or \"unknown\" if EPOCH isn't a number."
 (defvar-local reddigg-compose--kind nil
   "Symbol: `comment', `edit', or `submit'. Decides what C-c C-c does.")
 (defvar-local reddigg-compose--parent-id nil
-  "Fullname of the thing being replied to (kind `comment').")
+  "Fullname of the thing being replied to or edited.")
 (defvar-local reddigg-compose--target-marker nil
   "Marker in the source buffer where the result should be inserted/updated.")
 (defvar-local reddigg-compose--extra-fields nil
-  "Alist of extra POST fields the specific kind needs (e.g. thing_id for edit).")
+  "Alist of extra POST fields the specific kind needs.")
 
 (defvar-local reddigg-compose--submit-sr nil
   "Subreddit name for a `submit' compose buffer.")
@@ -642,19 +584,23 @@ as a new child heading under PARENT-MARKER's entry."
         (let* ((level (org-current-level))
                (author (gethash "author" comment-data))
                (body (gethash "body" comment-data))
-               (name (gethash "name" comment-data)))
+               (name (gethash "name" comment-data))
+               begin)
           (org-end-of-subtree t t)
           (unless (bolp) (insert "\n"))
           (insert (make-string (1+ level) ?*) " " author "\n")
           (insert ":PROPERTIES:\n")
           (insert (format ":REDDIGG_ID: %s\n" name))
           (insert (format ":REDDIGG_AUTHOR: %s\n" author))
-          (insert (format ":REDDIGG_SUBREDDIT: %s\n" (gethash "subreddit" comment-data)))
+          (insert (format ":REDDIGG_SUBREDDIT: %s\n" (or (gethash "subreddit" comment-data) "")))
           (insert (format ":REDDIGG_LIKES: %s\n" (reddigg--likes->string (gethash "likes" comment-data))))
           (insert (format ":REDDIGG_SCORE: %s\n" (gethash "score" comment-data)))
           (insert (format ":REDDIGG_CREATED: %s\n" (reddigg--format-created (gethash "created_utc" comment-data))))
           (insert ":END:\n")
-          (insert body "\n"))))))
+          (setq begin (point-marker))
+          (insert body "\n")
+          ;; tag the body so the new comment can be edited right away
+          (reddigg--mark-body-overlay begin (point-marker)))))))
 
 (defun reddigg--comment-data-with-fallback (server-comment local-body)
   "Build a comment-data hash-table to insert locally.
@@ -667,7 +613,9 @@ whatever the server gave us field-by-field, and fall back to
 what we already know locally (the exact text we sent, the
 logged-in username) or a sane placeholder otherwise."
   (let ((merged (make-hash-table :test 'equal))
-        (server-comment (or server-comment (make-hash-table :test 'equal))))
+        (server-comment (if (hash-table-p server-comment)
+                            server-comment
+                          (make-hash-table :test 'equal))))
     (puthash "author" (or (gethash "author" server-comment)
                            reddigg--current-user
                            "[unknown]")
@@ -684,13 +632,14 @@ logged-in username) or a sane placeholder otherwise."
              merged)
     merged))
 
-(defconst reddigg--comment-path "https://old.reddit.com/api/comment")
+(defconst reddigg--comment-action "comment"
+  "Server action for replying.  Params: parent, text.")
 
 (defun reddigg--send-comment (compose-buffer body)
   (let ((parent-id (buffer-local-value 'reddigg-compose--parent-id compose-buffer))
         (target-marker (buffer-local-value 'reddigg-compose--target-marker compose-buffer)))
-    (promise-chain (reddigg--promise-post reddigg--comment-path
-                                          (list (cons "thing_id" parent-id)
+    (promise-chain (reddigg--promise-post reddigg--comment-action
+                                          (list (cons "parent" parent-id)
                                                 (cons "text" body)))
       (then (lambda (data)
               ;; The POST has already succeeded by this point. Everything
@@ -699,11 +648,13 @@ logged-in username) or a sane placeholder otherwise."
               ;; up to promise-catch, where it would be misreported as a
               ;; failed reply even though reddit already has the comment.
               (condition-case err
-                  (let* ((json (gethash "json" data))
-                         (things (and json (gethash "data" json)
-                                      (gethash "things" (gethash "data" json))))
-                         (server-comment (and things (> (length things) 0)
-                                               (gethash "data" (aref things 0)))))
+                  (let* ((json (and (hash-table-p data) (gethash "json" data)))
+                         (jdata (and (hash-table-p json) (gethash "data" json)))
+                         (things (and (hash-table-p jdata) (gethash "things" jdata)))
+                         (first-thing (and things (> (length things) 0)
+                                           (elt things 0)))
+                         (server-comment (and (hash-table-p first-thing)
+                                              (gethash "data" first-thing))))
                     (reddigg--insert-new-comment
                      target-marker
                      (reddigg--comment-data-with-fallback server-comment body)))
@@ -714,7 +665,8 @@ failed (%s); refresh to see it." (error-message-string err))))
                 (kill-buffer compose-buffer))
               (message "reddigg: reply posted")))
       (promise-catch (lambda (reason)
-                       (message "reddigg: reply failed: %s" reason))))))
+                       (message "reddigg: reply failed: %s"
+                                (reddigg--reason-string reason)))))))
 
 ;;;###autoload
 (defun reddigg-reply-at-point ()
@@ -724,6 +676,9 @@ failed (%s); refresh to see it." (error-message-string err))))
          (parent-id (plist-get thing :id))
          (parent-marker (point-marker))
          (buf (generate-new-buffer "*reddigg-reply*")))
+    ;; learn our username while the user types, so the locally inserted
+    ;; reply is attributed correctly
+    (reddigg--prefetch-session)
     (with-current-buffer buf
       (org-mode)
       (reddigg-compose-mode 1)
@@ -735,7 +690,9 @@ failed (%s); refresh to see it." (error-message-string err))))
     (pop-to-buffer buf)
     (goto-char (point-max))))
 
-(defconst reddigg--submit-path "https://old.reddit.com/api/submit")
+(defconst reddigg--submit-action "submit"
+  "Server action for new submissions.
+Params: subreddit, title, kind, text, url.")
 
 (defun reddigg--submit-comments-path (post-id)
   "Return a reddigg comments path for the submitted POST-ID."
@@ -743,19 +700,21 @@ failed (%s); refresh to see it." (error-message-string err))))
 
 (defun reddigg--send-submit (compose-buffer body)
   "Submit the post described by COMPOSE-BUFFER with BODY."
-  (let ((subreddit (buffer-local-value 'reddigg-compose--submit-sr compose-buffer))
-        (kind (buffer-local-value 'reddigg-compose--submit-kind compose-buffer))
-        (title (buffer-local-value 'reddigg-compose--submit-title compose-buffer)))
+  (let* ((subreddit (buffer-local-value 'reddigg-compose--submit-sr compose-buffer))
+         (kind (buffer-local-value 'reddigg-compose--submit-kind compose-buffer))
+         (title (buffer-local-value 'reddigg-compose--submit-title compose-buffer))
+         (link-p (equal kind "link")))
     (promise-chain
         (reddigg--promise-post
-         reddigg--submit-path
-         (append (list (cons "sr" subreddit)
-                       (cons "kind" kind)
-                       (cons "title" title))
-                 (list (cons (if (equal kind "link") "url" "text") body))))
+         reddigg--submit-action
+         (list (cons "subreddit" subreddit)
+               (cons "title" title)
+               (cons "kind" kind)
+               (cons "text" (if link-p "" body))
+               (cons "url" (if link-p body ""))))
       (then
        (lambda (data)
-         (let* ((json (gethash "json" data))
+         (let* ((json (and (hash-table-p data) (gethash "json" data)))
                 (payload (and (hash-table-p json) (gethash "data" json)))
                 (post-id (and (hash-table-p payload) (gethash "name" payload)))
                 (post-url (and (hash-table-p payload) (gethash "url" payload)))
@@ -771,7 +730,8 @@ failed (%s); refresh to see it." (error-message-string err))))
              (reddigg--view-comments comments-path t)))))
       (promise-catch
        (lambda (reason)
-         (message "reddigg: submit failed: %s" reason))))))
+         (message "reddigg: submit failed: %s"
+                  (reddigg--reason-string reason)))))))
 
 ;;;###autoload
 (defun reddigg-submit-post ()
@@ -808,8 +768,10 @@ failed (%s); refresh to see it." (error-message-string err))))
 
 ;;; --- Edit / delete your own content ----------------------------------------
 
-(defconst reddigg--editusertext-path "https://old.reddit.com/api/editusertext")
-(defconst reddigg--del-path "https://old.reddit.com/api/del")
+(defconst reddigg--edit-action "edit"
+  "Server action for editing text.  Params: id, text.")
+(defconst reddigg--del-action "delete"
+  "Server action for deleting.  Params: id.")
 
 (defun reddigg--replace-body-at-marker (heading-marker new-text)
   "Replace the editable body text of the reddigg entry at HEADING-MARKER
@@ -833,8 +795,8 @@ body in this buffer to update it locally; refresh to see the change.")
 (defun reddigg--send-edit (compose-buffer body)
   (let ((thing-id (buffer-local-value 'reddigg-compose--parent-id compose-buffer))
         (target-marker (buffer-local-value 'reddigg-compose--target-marker compose-buffer)))
-    (promise-chain (reddigg--promise-post reddigg--editusertext-path
-                                          (list (cons "thing_id" thing-id)
+    (promise-chain (reddigg--promise-post reddigg--edit-action
+                                          (list (cons "id" thing-id)
                                                 (cons "text" body)))
       (then (lambda (_data)
               (reddigg--replace-body-at-marker target-marker body)
@@ -842,7 +804,24 @@ body in this buffer to update it locally; refresh to see the change.")
                 (kill-buffer compose-buffer))
               (message "reddigg: edit saved")))
       (promise-catch (lambda (reason)
-                       (message "reddigg: edit failed: %s" reason))))))
+                       (message "reddigg: edit failed: %s"
+                                (reddigg--reason-string reason)))))))
+
+(defun reddigg--open-edit-buffer (id marker existing-text)
+  "Pop up an edit compose buffer for thing ID (heading at MARKER),
+pre-filled with EXISTING-TEXT."
+  (let ((buf (generate-new-buffer "*reddigg-edit*")))
+    (with-current-buffer buf
+      (org-mode)
+      (reddigg-compose-mode 1)
+      (setq-local reddigg-compose--kind 'edit)
+      (setq-local reddigg-compose--parent-id id)
+      (setq-local reddigg-compose--target-marker marker)
+      (insert (format "# reddigg: editing %s\n" id))
+      (insert "# reddigg: C-c C-c to save, C-c C-k to abort\n\n")
+      (when existing-text (insert existing-text)))
+    (pop-to-buffer buf)
+    (goto-char (point-max))))
 
 ;;;###autoload
 (defun reddigg-edit-at-point ()
@@ -850,29 +829,25 @@ body in this buffer to update it locally; refresh to see the change.")
 Only works on entries you authored; only self-posts and comments have
 editable text on reddit (link posts don't)."
   (interactive)
+  ;; Gather everything that depends on point *now*; the session lookup
+  ;; below is asynchronous.
   (let* ((thing (reddigg--thing-at-point))
          (id (plist-get thing :id))
-         (author (plist-get thing :author)))
-    (unless (and reddigg--current-user (equal author reddigg--current-user))
-      (user-error "reddigg: this entry isn't yours to edit (author: %s)"
-                 (or author "unknown")))
-    (let* ((ov (reddigg--find-body-overlay))
-           (existing-text (when ov
-                            (buffer-substring-no-properties
-                             (overlay-start ov) (overlay-end ov))))
-           (marker (point-marker))
-           (buf (generate-new-buffer "*reddigg-edit*")))
-      (with-current-buffer buf
-        (org-mode)
-        (reddigg-compose-mode 1)
-        (setq-local reddigg-compose--kind 'edit)
-        (setq-local reddigg-compose--parent-id id)
-        (setq-local reddigg-compose--target-marker marker)
-        (insert (format "# reddigg: editing %s\n" id))
-        (insert "# reddigg: C-c C-c to save, C-c C-k to abort\n\n")
-        (when existing-text (insert existing-text)))
-      (pop-to-buffer buf)
-      (goto-char (point-max)))))
+         (author (plist-get thing :author))
+         (ov (reddigg--find-body-overlay))
+         (existing-text (when ov
+                          (buffer-substring-no-properties
+                           (overlay-start ov) (overlay-end ov))))
+         (marker (point-marker)))
+    (promise-chain (reddigg--promise-session-info)
+      (then (lambda (info)
+              (unless (equal author (cdr info))
+                (user-error "reddigg: this entry isn't yours to edit (author: %s)"
+                            (or author "unknown")))
+              (reddigg--open-edit-buffer id marker existing-text)))
+      (promise-catch (lambda (reason)
+                       (message "reddigg: cannot edit: %s"
+                                (reddigg--reason-string reason)))))))
 
 ;;;###autoload
 (defun reddigg-delete-at-point ()
@@ -882,21 +857,26 @@ editable text on reddit (link posts don't)."
          (id (plist-get thing :id))
          (author (plist-get thing :author))
          (marker (point-marker)))
-    (unless (and reddigg--current-user (equal author reddigg--current-user))
-      (user-error "reddigg: this entry isn't yours to delete (author: %s)"
-                 (or author "unknown")))
-    (when (y-or-n-p "reddigg: really delete this? ")
-      (promise-chain (reddigg--promise-post reddigg--del-path (list (cons "id" id)))
-        (then (lambda (_data)
-                (with-current-buffer (marker-buffer marker)
-                  (let ((inhibit-read-only t))
-                    (save-excursion
-                      (goto-char marker)
-                      (org-back-to-heading t)
-                      (org-cut-subtree))))
-                (message "reddigg: deleted")))
-        (promise-catch (lambda (reason)
-                         (message "reddigg: delete failed: %s" reason)))))))
+    (promise-chain (reddigg--promise-session-info)
+      (then (lambda (info)
+              (unless (equal author (cdr info))
+                (user-error "reddigg: this entry isn't yours to delete (author: %s)"
+                            (or author "unknown")))
+              (if (not (y-or-n-p "reddigg: really delete this? "))
+                  (message "reddigg: delete cancelled")
+                (promise-then
+                 (reddigg--promise-post reddigg--del-action (list (cons "id" id)))
+                 (lambda (_data)
+                   (with-current-buffer (marker-buffer marker)
+                     (let ((inhibit-read-only t))
+                       (save-excursion
+                         (goto-char marker)
+                         (org-back-to-heading t)
+                         (org-cut-subtree))))
+                   (message "reddigg: deleted"))))))
+      (promise-catch (lambda (reason)
+                       (message "reddigg: delete failed: %s"
+                                (reddigg--reason-string reason)))))))
 
 ;;; --- View-buffer keymap (voting, replying, editing, deleting) --------------
 
@@ -916,7 +896,7 @@ editable text on reddit (link posts don't)."
   :lighter " reddigg"
   :keymap reddigg-view-mode-map)
 
-;;; --- rest of the package (unchanged) ------------------------------------
+;;; --- buffers and rendering -----------------------------------------------
 
 (defvar reddigg--main-buffer "*reddigg-main*"
   "Buffer for main page.")
@@ -1052,7 +1032,7 @@ after deleting the current line which should be the More button."
            (insert "comments: " (format "%s" (gethash "num_comments" my-it)) " | ")
            (insert "created: " (format-time-string "%Y-%m-%d" (gethash "created_utc" my-it)) "\n")
            (let ((selftext (gethash "selftext" my-it)) begin end)
-             (if (string-empty-p selftext)
+             (if (or (null selftext) (string-empty-p selftext))
                  (insert (format "%s \n[[eww:%s][view in eww]]\n"
                                  (gethash "url" my-it) (gethash "url" my-it)))
                (setq begin (point-marker))
@@ -1136,7 +1116,7 @@ Return the value of `reddigg--cmt-list-id'."
     (insert (format "[[elisp:(reddigg--view-comments \"%s\" t)][refresh]]\n"
                     (ht-get cmt "permalink")))
     (setq begin (point-marker))
-    (insert (gethash "selftext" cmt) "\n")
+    (insert (or (gethash "selftext" cmt) "") "\n")
     (setq end (point-marker))
     (reddigg--sanitize-range begin end)
     (reddigg--mark-body-overlay begin end)
@@ -1172,12 +1152,11 @@ Return the value of `reddigg--cmt-list-id'."
 
 ;;;###autoload
 (defun reddigg-view-comments (cmt)
-  "Ask and print CMT to buffer."
+  "Ask and print CMT to buffer.
+CMT may be a full reddit URL or a path like
+r/emacs/comments/lfww57/weekly_tipstricketc_thread/."
   (interactive "sComment: ")
-  (when (string-prefix-p "https" cmt)
-    (setq cmt
-          (substring cmt
-                     (length "https://old.reddit.com/") nil)))
+  ;; `reddigg--promise-comments' normalizes URLs/slashes itself.
   (reddigg--view-comments cmt))
 
 (defun reddigg--view-comments (cmt &optional new-window)
@@ -1192,7 +1171,8 @@ Return the value of `reddigg--cmt-list-id'."
                 (reddigg--get-cmt-buffer)
                 '(display-buffer-use-some-window (inhibit-same-window . t)))))))
     (promise-catch (lambda (reason)
-                     (message "catch error in promise: %s" reason)))))
+                     (message "reddigg: could not load comments: %s"
+                              (reddigg--reason-string reason))))))
 
 
 (cl-defun reddigg--view-sub (sub &key after before append sort scope)
@@ -1216,7 +1196,8 @@ SCOPE: hour, day, week, year, all."
     (then (lambda (&rest _)
             (switch-to-buffer (reddigg--get-buffer))))
     (promise-catch (lambda (reason)
-                     (message "catch error in promise: %s" reason)))))
+                     (message "reddigg: could not load %s: %s"
+                              sub (reddigg--reason-string reason))))))
 
 (defun reddigg--view-more-cmts (level children)
   "Get more comments from CHILDREN and print at LEVEL."
@@ -1228,7 +1209,8 @@ SCOPE: hour, day, week, year, all."
             (save-excursion
               (reddigg--print-comment-list result level))))
     (promise-catch (lambda (reason)
-                     (message "catch error in promise: %s" reason)))))
+                     (message "reddigg: could not load more comments: %s"
+                              (reddigg--reason-string reason))))))
 
 ;;;###autoload
 (defun reddigg-view-sub (sub)
