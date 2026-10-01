@@ -43,6 +43,11 @@
  * The script reconnects automatically with exponential backoff, and
  * queues nothing: requests fail fast if the socket is down so the
  * server can retry/open a tab.
+ *
+ * A small floating status pill (bottom-right) shows the connection
+ * state at a glance: grey while connecting, green when connected
+ * (with the logged-in user), orange while reconnecting.  Click it to
+ * toggle the connection.
  */
 
 (function () {
@@ -74,6 +79,9 @@
   let reconnectTimer = null;
   let helloTimer = null;
   let closedByUs = false;
+
+  // Last known logged-in user, learned from a successful hello.
+  let currentUser = null;
 
   // ---- logging -----------------------------------------------------------
 
@@ -323,6 +331,7 @@
 
   function sendHello() {
     const s = sessionInfo();
+    currentUser = s.user || null;
     wsSend({
       type: 'hello',
       url: location.href,
@@ -330,6 +339,8 @@
       modhash: s.modhash,
       ts: Date.now(),
     });
+    // Refresh the pill so the user name shows once we know it.
+    if (socket && socket.readyState === WebSocket.OPEN) setStatus('connected');
   }
 
   async function handleRequest(msg) {
@@ -352,10 +363,13 @@
   }
 
   function connect() {
-    if (closedByUs) return;
+    if (closedByUs) {
+      closedByUs = false;
+    }
     clearTimeout(reconnectTimer);
 
     log(`connecting to ${WS_URL} ...`);
+    setStatus('connecting');
     try {
       socket = new WebSocket(WS_URL);
     } catch (err) {
@@ -385,8 +399,10 @@
 
     socket.addEventListener('close', () => {
       log('disconnected');
+      currentUser = null;
       clearInterval(helloTimer);
       helloTimer = null;
+      if (!closedByUs) setStatus('disconnected');
       scheduleReconnect();
     });
 
@@ -406,6 +422,104 @@
     reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
   }
 
+  // ---- connection status pill -------------------------------------------
+
+  //
+  // A tiny always-visible indicator in the corner of the page, so you
+  // can tell at a glance whether the bridge is up without opening the
+  // devtools console.  It mirrors the deepseek-style status button:
+  // a colored dot plus a short label that changes with the socket
+  // state.  Clicking it toggles the connection.
+  //
+
+  const PILL_ID = 'reddigg-ws-status';
+  let pillEl = null;
+  let pillDot = null;
+  let pillLabel = null;
+
+  const STATUS_STYLES = {
+    connecting: { color: '#9aa0a6', text: 'reddigg: connecting\u2026' },
+    connected: { color: '#2ecc71', text: 'reddigg: connected' },
+    disconnected: { color: '#e67e22', text: 'reddigg: reconnecting\u2026' },
+    off: { color: '#e74c3c', text: 'reddigg: disconnected' },
+  };
+
+  function buildPill() {
+    if (pillEl || !document.body) return;
+
+    pillEl = document.createElement('button');
+    pillEl.id = PILL_ID;
+    pillEl.type = 'button';
+    pillEl.title = `reddigg websocket bridge (${WS_URL}) \u2014 click to toggle`;
+    Object.assign(pillEl.style, {
+      position: 'fixed',
+      right: '12px',
+      bottom: '12px',
+      zIndex: '2147483647',
+      display: 'flex',
+      alignItems: 'center',
+      gap: '6px',
+      padding: '4px 9px',
+      margin: '0',
+      border: '1px solid rgba(0,0,0,0.15)',
+      borderRadius: '999px',
+      background: 'rgba(255,255,255,0.92)',
+      color: '#222',
+      font: '600 11px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif',
+      cursor: 'pointer',
+      boxShadow: '0 1px 4px rgba(0,0,0,0.2)',
+      opacity: '0.85',
+      transition: 'opacity .15s ease',
+    });
+    pillEl.addEventListener('mouseenter', () => { pillEl.style.opacity = '1'; });
+    pillEl.addEventListener('mouseleave', () => { pillEl.style.opacity = '0.85'; });
+
+    pillDot = document.createElement('span');
+    Object.assign(pillDot.style, {
+      width: '8px',
+      height: '8px',
+      borderRadius: '50%',
+      background: STATUS_STYLES.connecting.color,
+      flex: '0 0 auto',
+    });
+
+    pillLabel = document.createElement('span');
+    pillLabel.textContent = STATUS_STYLES.connecting.text;
+
+    pillEl.appendChild(pillDot);
+    pillEl.appendChild(pillLabel);
+    pillEl.addEventListener('click', () => {
+      // Toggle: if we have a live socket, close it and stop; otherwise
+      // (re)connect.  closedByUs is reset by connect().
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        closedByUs = true;
+        setStatus('off');
+        clearInterval(helloTimer);
+        clearTimeout(reconnectTimer);
+        try { socket.close(); } catch (_) { /* ignore */ }
+        log('disconnected by user (click to reconnect)');
+      } else {
+        connect();
+      }
+    });
+
+    document.body.appendChild(pillEl);
+  }
+
+  /**
+   * Update the pill's color + text.
+   * @param {'connecting'|'connected'|'disconnected'|'off'} state
+   */
+  function setStatus(state) {
+    buildPill();
+    if (!pillEl) return;
+    const s = STATUS_STYLES[state] || STATUS_STYLES.connecting;
+    pillDot.style.background = s.color;
+    let text = s.text;
+    if (state === 'connected' && currentUser) text += ` (${currentUser})`;
+    pillLabel.textContent = text;
+  }
+
   // ---- boot --------------------------------------------------------------
 
   // Expose a tiny control surface for debugging from the devtools console.
@@ -413,14 +527,22 @@
     connect,
     disconnect() {
       closedByUs = true;
+      setStatus('off');
       clearInterval(helloTimer);
       clearTimeout(reconnectTimer);
       if (socket) socket.close();
     },
     session: sessionInfo,
     actions,
+    setStatus,
+    get statusEl() { return pillEl; },
     get socket() { return socket; },
   };
+
+  // The pill needs a <body>; on old.reddit it usually exists, but be
+  // defensive in case the script runs before the DOM is ready.
+  if (document.body) buildPill();
+  else document.addEventListener('DOMContentLoaded', buildPill, { once: true });
 
   connect();
 })();
