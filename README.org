@@ -13,7 +13,17 @@ It also lets you vote, reply, edit, delete, and submit posts.
 
 Reddit requests now require a logged-in browser session for these actions.
 
-~reddigg.el~ uses [[https://github.com/dmgerman/browser-gt][browser-gt]] to run Reddit requests inside your browser.
+~reddigg.el~ talks to a small local Python server.
+
+The server relays each request to a userscript running in your logged-in Reddit tab.
+
+#+begin_example
+Emacs  <--HTTP-->  server/reddigg_server.py  <--websocket-->  userscript in Reddit tab
+#+end_example
+
+The tab performs the request with your own session, so no API keys are needed.
+* breaking change version 0.9.0: no longer depends on ~browser-gt~
+use ~browser-gt~ branch if you prefer it.
 
 * Requirements
 
@@ -21,20 +31,48 @@ Reddit requests now require a logged-in browser session for these actions.
 - ~promise~ 1.1 or later.
 - ~ht~ 2.3 or later.
 - ~org~ 9.2 or later.
-- [[https://github.com/dmgerman/browser-gt][browser-gt]] with its Emacs package and browser extension.
+- [[https://docs.astral.sh/uv/][uv]], which runs the server and installs its dependencies from ~server/pyproject.toml~.
+- A userscript manager such as Tampermonkey or Violentmonkey.
 - A logged-in Reddit session in the browser.
 
 * Setup
 
 1. Install the required Emacs packages.
-2. Install and configure ~browser-gt~.
-3. Start the ~browser-gt~ Emacs client.
-4. Load the ~browser-gt~ browser extension.
-5. Log in to Reddit in that browser.
-6. Open a Reddit tab in that browser.
+2. Start the server: ~cd server && uv run reddigg_server.py~.
+3. Install ~userscript/reddigg-ws.user.js~ in your userscript manager.
+4. Log in to Reddit and open an ~old.reddit.com~ tab.
+5. Allow the connection when the browser prompts for permission.
+6. Check that the toggle button at the bottom right corner shows connected.
 7. Load ~reddigg.el~ in Emacs.
+8. Run ~M-x reddigg-ping~ to check the whole chain.
 
-If no Reddit tab exists, let ~reddigg~ open one when it asks.
+The browser asks for permission because the userscript connects to ~127.0.0.1~.
+
+Choose to always allow it, or the prompt returns on each page load.
+
+The server listens on ~127.0.0.1:1979~ only.
+
+Use ~--port~ to change the port.
+
+The userscript uses port 1979 unless the page URL has ~?reddigg_ws_port=PORT~.
+
+* Server and userscript
+
+The server creates a secret token in =~/.config/reddigg/token= on first run.
+
+~reddigg.el~ reads it and sends it in the ~X-Bridge-Token~ header.
+
+Set ~REDDIGG_TOKEN_FILE~ to use a different token file.
+
+The userscript adds a button that shows the connection state: grey is connecting, green is connected, orange is reconnecting.
+
+Click the button to toggle the connection to the server.
+
+The server accepts websocket connections from ~reddit.com~ origins only.
+
+Use ~--origin~ to allow others, ~--repl~ for an interactive prompt, and ~-v~ for debug logs.
+
+If several tabs are connected, the most recently active one is used.
 
 * Buffers
 
@@ -52,15 +90,15 @@ Enter on a Reddit link to run its Emacs command.
 
 ~reddigg-subs~ lists the subreddits for ~*reddigg-main*~.
 
-~reddigg-browser-gt-client~ selects a browser client when more than one client connects.
+~reddigg-server-url~ is the server's base URL.
 
-Set it to ~nil~ for automatic client selection.
+The default is ~http://127.0.0.1:1979/reddigg~. Change it if you use ~--port~.
 
-~reddigg-reddit-host-regexp~ identifies Reddit tabs by their URL.
+~reddigg-token-file~ is the path to the server token.
 
-~reddigg-reddit-open-url~ sets the URL that ~reddigg~ opens when no Reddit tab exists.
+The default follows ~REDDIGG_TOKEN_FILE~, then ~$XDG_CONFIG_HOME/reddigg/token~, then =~/.config/reddigg/token=.
 
-~reddigg-browser-gt-tab-wait-timeout~ sets the wait time for a new Reddit tab.
+~reddigg-request-timeout~ sets how many seconds Emacs waits for one request. The default is 35.
 
 * Commands
 
@@ -74,7 +112,9 @@ Set it to ~nil~ for automatic client selection.
 
 ~reddigg-submit-post~ starts a new post.
 
-~reddigg-refresh-session~ reloads the Reddit login data used for write actions.
+~reddigg-ping~ checks that the server is up and a Reddit tab is connected.
+
+~reddigg-refresh-session~ reloads the logged-in username after a login change.
 
 * Read posts
 
@@ -149,16 +189,16 @@ Press ~C-c C-k~ to abort the current compose buffer.
 
 * Reddit session
 
-Write actions use the Reddit session in the browser.
+Write actions use the Reddit session in the userscript tab.
 
-~reddigg~ reads the CSRF token and username from the Reddit page.
+The userscript reads the CSRF token and username from the Reddit page.
 
 ~reddigg-refresh-session~ refreshes these values after a login change.
 
 * Remarks
 
-~reddigg~ uses the Reddit API through JavaScript that runs inside the Reddit tab.
+~reddigg~ uses the Reddit API through the userscript running inside the Reddit tab.
 
-Keep the Reddit tab logged in while you use write commands.
+Keep the Reddit tab open and logged in while you use ~reddigg~.
 
 For a complete Reddit client, see [[https://github.com/ahungry/md4rd][md4rd]].
