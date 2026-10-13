@@ -1,23 +1,32 @@
 #!/usr/bin/env python3
-"""reddigg websocket server.
+"""reddigg server: relays typed requests to the reddigg userscript running
+in a logged-in reddit tab.  One port, one event loop (aiohttp):
 
-This is the Python half of the reddigg browser bridge.  It owns a
-websocket connection to one or more reddit tabs running
-``userscript/reddigg-ws.user.js`` and exposes a small CRUD API to
-whatever wants to drive reddit (Emacs, curl, another script...).
+    ws://127.0.0.1:1979/ws                    the userscript connects here
+                                              (the root path "/" works too, so
+                                              the userscript needs no change)
+    GET  http://127.0.0.1:1979/reddigg/tabs     list connected tabs
+    GET  http://127.0.0.1:1979/reddigg/ping
+    GET  http://127.0.0.1:1979/reddigg/session
+    GET  http://127.0.0.1:1979/reddigg/get?path=/r/emacs.json%3Fcount%3D25
+    POST http://127.0.0.1:1979/reddigg/vote     {"id": "t3_abc", "dir": 1}
+    POST http://127.0.0.1:1979/reddigg/comment  {"parent": "t3_abc", "text": "hi"}
+    POST http://127.0.0.1:1979/reddigg/edit     {"id": "t1_abc", "text": "..."}
+    POST http://127.0.0.1:1979/reddigg/delete   {"id": "t1_abc"}
+    POST http://127.0.0.1:1979/reddigg/submit   {"subreddit": ..., "title": ...,
+                                                 "kind": "self|link", "text": ...,
+                                                 "url": ...}
 
-The browser tab is the only thing that can actually talk to reddit
-with the user's real, logged-in session, so this server never touches
-reddit itself: it just relays typed requests to the tab and returns
-the JSON the tab produced.  That mirrors reddigg.el's browser-gt path
-(``EVAL_IN_ACTIVE_TAB`` + same-origin ``fetch``), except the transport
-is a websocket on localhost:1979 instead of browser-gt.
+Every REST route also accepts ``?tab=<id>`` to pick a specific tab and
+``?timeout=<seconds>`` (max 120).  Replies are ``{"ok": true, "result": ...}``
+or ``{"error": "..."}`` with a 4xx/5xx status.
 
-Requires ``websockets`` >= 10.1 (works with both the legacy and the
-new asyncio API, including 13/14/15).
+The browser tab is the only thing that can talk to reddit with the user's
+real, logged-in session, so this server never touches reddit itself: it
+relays requests to the tab and returns the JSON the tab produced.
 
-Protocol (JSON, one object per websocket message)
--------------------------------------------------
+Protocol (JSON, one object per websocket message; unchanged)
+------------------------------------------------------------
 
 server -> page (request)::
 
@@ -33,50 +42,53 @@ page -> server (unsolicited, on connect and every 20s)::
 
     {"type": "hello", "url": ..., "user": ..., "modhash": ...}
 
-The server multiplexes all connected tabs through one request/response
-coroutine (:meth:`Bridge.call`).  If more than one tab is connected,
-the most recently-hello'd one is used by default; pass ``client`` to
-pick a specific connection.
+If more than one tab is connected, the most recently seen one is used
+by default.
 
-Usage
------
+Security model:
+  * binds to 127.0.0.1 only
+  * REST requires a secret token header (X-Bridge-Token), a Host header
+    naming this server (blocks DNS rebinding), and no Origin header
+    (browsers always send Origin on cross-origin requests; curl and Emacs
+    don't), so web pages can't drive it
+  * the websocket handshake checks Origin against an allow-list (browsers
+    can't forge Origin; other local processes can, which is accepted for a
+    single-user machine)
 
-    python3 server/reddigg_server.py            # listen on 127.0.0.1:1979
-    python3 server/reddigg_server.py --port 1979 --host 127.0.0.1
-
-As a library::
-
-    from reddigg_server import Bridge, serve
-    bridge = Bridge()
-    asyncio.create_task(serve(bridge, host="127.0.0.1", port=1979))
-    data = await bridge.call("get", {"path": "/r/emacs.json?count=25"})
-    await bridge.call("vote", {"id": "t3_abc", "dir": 1})
-    await bridge.call("comment", {"parent": "t3_abc", "text": "hi"})
+Requires: aiohttp >= 3.9
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import concurrent.futures
 import json
 import logging
-import threading
+import os
+import re
+import secrets
 import time
 import uuid
 from dataclasses import dataclass, field
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Optional
-from urllib.parse import parse_qs, urlparse
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-import websockets
+from aiohttp import WSMsgType, web
 
 log = logging.getLogger("reddigg")
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 1979
-DEFAULT_REST_PORT = 1980
+WS_PATHS = ("/ws", "/")  # "/" so a userscript pointing at ws://host:port keeps working
 REST_ROOT = "/reddigg"
+MAX_WS_MESSAGE = 2**24  # 16 MiB; aiohttp's 4 MiB default can be too small for big listings
+TOKEN_FILE = Path(
+    os.environ.get(
+        "REDDIGG_TOKEN_FILE",
+        str(Path.home() / ".config" / "reddigg" / "token"),
+    )
+)
+DEFAULT_ORIGINS = [r"https://([a-z0-9-]+\.)?reddit\.com"]
 
 # Actions the userscript knows how to perform.  Kept in sync with
 # ``userscript/reddigg-ws.user.js``.
@@ -90,30 +102,44 @@ ACTIONS = {
     "delete",
     "submit",
 }
+READ_ONLY = {"ping", "session", "get"}
+WRITE = {"vote", "comment", "edit", "delete", "submit"}
 
 
 class ReddiggError(RuntimeError):
-    """Raised when a relayed action fails on the browser side."""
+    """The browser side reported an error."""
 
 
 class NoClientError(ReddiggError):
-    """Raised when a request is made but no reddit tab is connected."""
+    """No matching tab is connected."""
 
 
-class TimeoutError(ReddiggError):  # noqa: A001 - intentional public name
-    """Raised when the browser does not answer in time."""
+class ReddiggTimeout(ReddiggError):
+    """The tab did not answer in time."""
+
+
+def load_token() -> str:
+    if TOKEN_FILE.exists():
+        return TOKEN_FILE.read_text().strip()
+    TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    token = secrets.token_urlsafe(32)
+    fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(token + "\n")
+    return token
 
 
 @dataclass
 class Client:
     """A single connected reddit tab."""
 
-    ws: Any  # a websockets connection (legacy or new asyncio API)
+    ws: web.WebSocketResponse
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     url: Optional[str] = None
     user: Optional[str] = None
     modhash: Optional[str] = None
     last_seen: float = field(default_factory=time.time)
+    pending: Set[str] = field(default_factory=set)
 
     def describe(self) -> Dict[str, Any]:
         return {
@@ -125,51 +151,57 @@ class Client:
 
 
 class Bridge:
-    """Multiplexes action requests over the connected reddit tabs.
-
-    One :class:`Bridge` may have many tabs connected.  Requests are sent
-    to a chosen tab (most-recent by default) and awaited by ``id``.
-    """
+    """Multiplexes action requests over the connected reddit tabs."""
 
     def __init__(self) -> None:
         self._clients: Dict[str, Client] = {}
-        self._pending: Dict[str, asyncio.Future] = {}
-        self._default: Optional[str] = None
-        self._lock = asyncio.Lock()
+        # request id -> (client id, future); the client id lets us reject
+        # responses that come from a tab the request was never sent to.
+        self._pending: Dict[str, Tuple[str, asyncio.Future]] = {}
 
-    # -- connection bookkeeping -------------------------------------------
+    # -- connections -------------------------------------------------------
 
-    async def register(self, ws: Any) -> Client:
+    def register(self, ws: web.WebSocketResponse) -> Client:
         client = Client(ws=ws)
-        async with self._lock:
-            self._clients[client.id] = client
-            self._default = client.id
-        log.info("client %s connected (%d total)", client.id, len(self._clients))
+        self._clients[client.id] = client
+        log.info("tab %s connected (%d total)", client.id, len(self._clients))
         return client
 
-    async def unregister(self, client: Client) -> None:
-        async with self._lock:
-            self._clients.pop(client.id, None)
-            if self._default == client.id:
-                self._default = next(iter(self._clients), None)
-        log.info("client %s disconnected (%d left)", client.id, len(self._clients))
+    def unregister(self, client: Client) -> None:
+        self._clients.pop(client.id, None)
+        # Fail in-flight requests immediately instead of letting them
+        # sit until their timeout.
+        for rid in list(client.pending):
+            entry = self._pending.pop(rid, None)
+            if entry and not entry[1].done():
+                entry[1].set_exception(NoClientError("tab disconnected"))
+        log.info("tab %s disconnected (%d left)", client.id, len(self._clients))
 
-    def clients(self):
-        """Snapshot of connected tabs."""
+    def clients(self) -> List[Client]:
         return list(self._clients.values())
 
-    def default_client(self) -> Optional[Client]:
-        if self._default and self._default in self._clients:
-            return self._clients[self._default]
-        return next(iter(self._clients.values()), None)
+    def _pick(self, tab: Optional[str]) -> Client:
+        if tab:
+            c = self._clients.get(tab)
+            if c is None:
+                raise NoClientError(f"no connected tab with id {tab!r}")
+            return c
+        if not self._clients:
+            raise NoClientError(
+                "no reddit tab is connected; open old.reddit.com with the "
+                "reddigg-ws userscript enabled"
+            )
+        return max(self._clients.values(), key=lambda c: c.last_seen)
 
-    # -- message handling --------------------------------------------------
+    # -- incoming ----------------------------------------------------------
 
     async def on_message(self, client: Client, raw: str) -> None:
         try:
             msg = json.loads(raw)
         except (ValueError, TypeError):
-            log.warning("client %s sent non-JSON: %r", client.id, raw[:200])
+            log.warning("tab %s sent non-JSON: %r", client.id, raw[:200])
+            return
+        if not isinstance(msg, dict):
             return
 
         # Unsolicited "hello" keeps our view of the tab fresh.
@@ -181,14 +213,15 @@ class Bridge:
             log.debug("hello from %s: user=%s url=%s", client.id, client.user, client.url)
             return
 
-        req_id = msg.get("id")
-        if not req_id:
-            log.warning("client %s sent message without id: %r", client.id, msg)
+        rid = msg.get("id")
+        entry = self._pending.get(rid) if rid else None
+        if entry is None or entry[0] != client.id:
+            log.debug("ignoring response %r from tab %s", rid, client.id)
             return
-
-        fut = self._pending.pop(req_id, None)
-        if fut is None or fut.done():
-            log.debug("late/unknown response id=%s from %s", req_id, client.id)
+        self._pending.pop(rid, None)
+        client.pending.discard(rid)
+        fut = entry[1]
+        if fut.done():
             return
         if msg.get("ok"):
             fut.set_result(msg.get("result"))
@@ -202,44 +235,38 @@ class Bridge:
         action: str,
         params: Optional[Dict[str, Any]] = None,
         *,
-        client: Optional[str] = None,
+        tab: Optional[str] = None,
         timeout: float = 30.0,
     ) -> Any:
         """Send ACTION with PARAMS to a tab and return its JSON result.
 
-        Raises :class:`NoClientError`, :class:`TimeoutError`, or
+        Raises :class:`NoClientError`, :class:`ReddiggTimeout`, or
         :class:`ReddiggError` (from the browser) as appropriate.
         """
         if action not in ACTIONS:
             raise ValueError(f"unknown action: {action!r} (expected one of {sorted(ACTIONS)})")
+        target = self._pick(tab)
+        if target.ws.closed:
+            raise NoClientError("tab disconnected")
 
-        if client is not None:
-            target = self._clients.get(client)
-            if target is None:
-                raise NoClientError(f"no connected client with id {client!r}")
-        else:
-            target = self.default_client()
-        if target is None:
-            raise NoClientError(
-                "no reddit tab is connected; open old.reddit.com with the "
-                "reddigg-ws userscript enabled"
-            )
-
-        req_id = uuid.uuid4().hex
-        loop = asyncio.get_running_loop()
-        fut: asyncio.Future = loop.create_future()
-        self._pending[req_id] = fut
-
-        payload = {"id": req_id, "action": action, "params": params or {}}
+        rid = uuid.uuid4().hex
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._pending[rid] = (target.id, fut)
+        target.pending.add(rid)
         try:
-            await target.ws.send(json.dumps(payload))
+            await target.ws.send_str(
+                json.dumps({"id": rid, "action": action, "params": params or {}})
+            )
             return await asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError as exc:
-            raise TimeoutError(
-                f"timed out after {timeout}s waiting for {action} on client {target.id}"
+            raise ReddiggTimeout(
+                f"timed out after {timeout}s waiting for {action} on tab {target.id}"
             ) from exc
+        except ConnectionError as exc:  # aiohttp: sending on a closing socket
+            raise NoClientError("tab disconnected") from exc
         finally:
-            self._pending.pop(req_id, None)
+            self._pending.pop(rid, None)
+            target.pending.discard(rid)
 
     # -- convenience wrappers (the CRUD API) -------------------------------
 
@@ -287,221 +314,110 @@ class Bridge:
         """
         return await self.call(
             "submit",
-            {
-                "subreddit": subreddit,
-                "title": title,
-                "kind": kind,
-                "text": text,
-                "url": url,
-            },
+            {"subreddit": subreddit, "title": title, "kind": kind, "text": text, "url": url},
             **kw,
         )
 
 
 # ---------------------------------------------------------------------------
-# websocket server glue
+# HTTP app
 # ---------------------------------------------------------------------------
 
 
-async def handler(bridge: Bridge, ws: Any) -> None:
-    client = await bridge.register(ws)
-    try:
-        async for raw in ws:
-            await bridge.on_message(client, raw)
-    except websockets.ConnectionClosed:
-        pass
-    finally:
-        await bridge.unregister(client)
+def _err(code: int, message: str) -> web.Response:
+    return web.json_response({"error": message}, status=code)
 
 
-async def serve(
-    bridge: Optional[Bridge] = None,
-    host: str = DEFAULT_HOST,
-    port: int = DEFAULT_PORT,
-) -> None:
-    """Run the websocket server until cancelled."""
-    bridge = bridge or Bridge()
+def make_app(bridge: Bridge, token: str, origins: List[re.Pattern], port: int) -> web.Application:
+    allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
 
-    # One-argument handler: accepted by the legacy API (websockets >= 10.1)
-    # and required by the new asyncio API (websockets >= 13), where the
-    # old ``(ws, path)`` signature no longer works.
-    async def ws_handler(ws: Any) -> None:
-        await handler(bridge, ws)
-
-    async with websockets.serve(ws_handler, host, port):
-        log.info("reddigg ws server listening on ws://%s:%d", host, port)
-        await asyncio.Future()  # run forever
-
-
-# ---------------------------------------------------------------------------
-# HTTP/REST glue
-# ---------------------------------------------------------------------------
-
-def _route(path: str) -> Optional[str]:
-    """Map an HTTP path to a bridge action name.
-
-    Returns the bridge action name for ``/reddigg/<action>``, or
-    ``None`` if the path is not a known REST route.  All state-changing
-    verbs take their arguments as JSON in the request body, so only the
-    read-only ``ping``/``session``/``get`` are meaningful via GET.
-    """
-    if not path.startswith(REST_ROOT + "/"):
-        return None
-    name = path[len(REST_ROOT) + 1 :].strip("/")
-    if name in {"ping", "session", "get"}:
-        return name
-    if name in {"vote", "comment", "edit", "delete", "submit"}:
-        return name
-    return None
-
-
-class _RESTHandler(BaseHTTPRequestHandler):
-    """One HTTP request handler; bridges onto the asyncio Bridge.
-
-    Runs on a worker thread inside :class:`ThreadingHTTPServer`.  Every
-    call is handed to the asyncio event loop via
-    ``asyncio.run_coroutine_threadsafe`` and its result awaited from
-    this thread.  ``server.bridge`` and ``server.loop`` are set by
-    :class:`RESTServer`.
-    """
-
-    server_version = "reddigg/0.1"
-
-    # keep the terminal tidy: log through our logger, not stderr
-    def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003
-        log.debug("rest %s - %s", self.address_string(), fmt % args)
-
-    # -- helpers ----------------------------------------------------------
-
-    def _send(self, code: int, payload: Any) -> None:
-        body = json.dumps(payload).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _read_body(self) -> Dict[str, Any]:
-        length = int(self.headers.get("Content-Length") or 0)
-        if length <= 0:
-            return {}
-        raw = self.rfile.read(length)
+    @web.middleware
+    async def guard(request: web.Request, handler: Any) -> web.StreamResponse:
+        if request.path in WS_PATHS and request.headers.get("Upgrade", "").lower() == "websocket":
+            return await handler(request)  # origin-checked in the route itself
+        if request.headers.get("Host") not in allowed_hosts:
+            return _err(403, "bad Host header")
+        if "Origin" in request.headers:
+            return _err(403, "browser-originated requests are not allowed")
+        supplied = request.headers.get("X-Bridge-Token") or ""
+        if not secrets.compare_digest(supplied, token):
+            return _err(403, "missing or invalid X-Bridge-Token")
         try:
-            data = json.loads(raw)
-        except (ValueError, TypeError):
-            raise ValueError("request body is not valid JSON")
-        if not isinstance(data, dict):
-            raise ValueError("request body must be a JSON object")
-        return data
+            return await handler(request)
+        except web.HTTPException as exc:  # 404/405 etc.: keep every reply JSON
+            return _err(exc.status, exc.reason)
 
-    def _dispatch(self, action: str, params: Dict[str, Any], query: Dict[str, Any]) -> None:
-        server = self.server  # type: ignore[assignment]
-        if action == "get":
-            # /reddigg/get?path=/r/emacs.json?count=5 : the whole reddit
-            # path (including its own query) arrives as one `path` value.
-            params.setdefault("path", query.get("path", ""))
-
-        async def _run() -> Any:
-            return await server.bridge.call(action, params, timeout=server.timeout)
-
-        fut = asyncio.run_coroutine_threadsafe(_run(), server.loop)
+    async def ws_route(request: web.Request) -> web.StreamResponse:
+        origin = request.headers.get("Origin")
+        if not origin or not any(p.fullmatch(origin) for p in origins):
+            log.warning("rejected websocket from origin %r", origin)
+            return _err(403, "origin not allowed")
+        ws = web.WebSocketResponse(max_msg_size=MAX_WS_MESSAGE)
+        await ws.prepare(request)
+        client = bridge.register(ws)
         try:
-            # Slightly longer than the bridge's own timeout, so the bridge
-            # normally reports the timeout itself (as our TimeoutError).
-            result = fut.result(timeout=server.timeout + 5)
-        except concurrent.futures.TimeoutError:
-            # Backstop: the coroutine did not finish even after the bridge
-            # timeout.  This is a *different* class from the module's own
-            # TimeoutError below, so it needs its own handler -- otherwise
-            # the worker thread dies and the client never gets a reply.
-            fut.cancel()
-            self._send(504, {"error": f"timed out waiting for {action}"})
-            return
+            async for msg in ws:
+                if msg.type == WSMsgType.TEXT:
+                    await bridge.on_message(client, msg.data)
+                elif msg.type == WSMsgType.ERROR:
+                    log.warning("tab %s websocket error: %s", client.id, ws.exception())
+        finally:
+            bridge.unregister(client)
+        return ws
+
+    async def tabs_route(request: web.Request) -> web.Response:
+        return web.json_response({"ok": True, "result": [c.describe() for c in bridge.clients()]})
+
+    async def action_route(request: web.Request) -> web.Response:
+        action = request.match_info["action"]
+        if request.method == "POST":
+            if request.content_type != "application/json":
+                return _err(415, "Content-Type must be application/json")
+            try:
+                params = await request.json()
+            except ValueError:
+                return _err(400, "request body is not valid JSON")
+            if not isinstance(params, dict):
+                return _err(400, "request body must be a JSON object")
+        else:
+            params = {}
+            if action == "get":
+                # /reddigg/get?path=/r/emacs.json%3Fcount%3D5 : the whole reddit
+                # path (including its own query) arrives as one `path` value.
+                params["path"] = request.query.get("path", "")
+
+        try:
+            timeout = min(float(request.query.get("timeout") or 30), 120.0)
+        except ValueError:
+            return _err(400, "`timeout` must be a number")
+
+        try:
+            result = await bridge.call(
+                action, params, tab=request.query.get("tab"), timeout=timeout
+            )
         except ValueError as exc:
-            self._send(400, {"error": str(exc)})
-            return
+            return _err(400, str(exc))
         except NoClientError as exc:
-            self._send(503, {"error": str(exc)})
-            return
-        except TimeoutError as exc:
-            self._send(504, {"error": str(exc)})
-            return
+            return _err(503, str(exc))
+        except ReddiggTimeout as exc:
+            return _err(504, str(exc))
         except ReddiggError as exc:
-            self._send(502, {"error": str(exc)})
-            return
+            return _err(502, str(exc))
         except Exception as exc:  # noqa: BLE001 - never leave the client hanging
             log.exception("unexpected error handling %s", action)
-            self._send(500, {"error": f"internal error: {exc}"})
-            return
-        self._send(200, {"ok": True, "result": result})
+            return _err(500, f"internal error: {exc}")
+        return web.json_response({"ok": True, "result": result})
 
-    # -- verbs ------------------------------------------------------------
-
-    def do_GET(self) -> None:  # noqa: N802 - http.server API
-        parsed = urlparse(self.path)
-        action = _route(parsed.path)
-        if action is None:
-            self._send(404, {"error": "not found"})
-            return
-        query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
-        self._dispatch(action, {}, query)
-
-    def do_POST(self) -> None:  # noqa: N802 - http.server API
-        parsed = urlparse(self.path)
-        action = _route(parsed.path)
-        if action is None:
-            self._send(404, {"error": "not found"})
-            return
-        try:
-            params = self._read_body()
-        except ValueError as exc:
-            self._send(400, {"error": str(exc)})
-            return
-        query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
-        self._dispatch(action, params, query)
-
-
-class RESTServer:
-    """Serves the :class:`Bridge` CRUD API over HTTP on a worker thread.
-
-    ``ThreadingHTTPServer`` is not asyncio-aware, so it is run in a
-    daemon thread and each request is marshalled back onto the event
-    loop that owns the bridge (``loop``) with
-    ``asyncio.run_coroutine_threadsafe``.
-    """
-
-    def __init__(
-        self,
-        bridge: Bridge,
-        loop: asyncio.AbstractEventLoop,
-        host: str = DEFAULT_HOST,
-        port: int = DEFAULT_REST_PORT,
-        timeout: float = 30.0,
-    ) -> None:
-        self.bridge = bridge
-        self.loop = loop
-        self.timeout = timeout
-        self._httpd = ThreadingHTTPServer((host, port), _RESTHandler)
-        self._httpd.bridge = bridge  # type: ignore[attr-defined]
-        self._httpd.loop = loop  # type: ignore[attr-defined]
-        self._httpd.timeout = timeout  # type: ignore[attr-defined]
-        self._thread = threading.Thread(
-            target=self._httpd.serve_forever,
-            name="reddigg-rest",
-            daemon=True,
-        )
-
-    def start(self) -> None:
-        self._thread.start()
-        log.info(
-            "reddigg rest server listening on http://%s:%d%s",
-            *self._httpd.server_address[:2],
-            REST_ROOT,
-        )
-
-    def stop(self) -> None:
-        self._httpd.shutdown()
-        self._httpd.server_close()
+    app = web.Application(middlewares=[guard])
+    app.add_routes(
+        [web.get(p, ws_route) for p in WS_PATHS]
+        + [
+            web.get(f"{REST_ROOT}/tabs", tabs_route),
+            web.get(f"{REST_ROOT}/{{action:{'|'.join(sorted(READ_ONLY))}}}", action_route),
+            web.post(f"{REST_ROOT}/{{action:{'|'.join(sorted(WRITE))}}}", action_route),
+        ]
+    )
+    return app
 
 
 # ---------------------------------------------------------------------------
@@ -571,56 +487,48 @@ async def _repl(bridge: Bridge) -> None:
             print(f"error: {exc}")
 
 
+# ---------------------------------------------------------------------------
+
+
 async def amain(args: argparse.Namespace) -> None:
+    token = load_token()
+    log.info("auth token is in %s", TOKEN_FILE)
+    origins = [re.compile(p) for p in (args.origin or DEFAULT_ORIGINS)]
     bridge = Bridge()
-    server_task = asyncio.create_task(serve(bridge, args.host, args.port))
-
-    rest: Optional[RESTServer] = None
-    if not args.no_rest:
-        rest = RESTServer(
-            bridge,
-            asyncio.get_running_loop(),
-            host=args.host,
-            port=args.rest_port,
-        )
-        rest.start()
-
+    app = make_app(bridge, token, origins, args.port)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
     try:
+        await web.TCPSite(runner, args.host, args.port).start()
+        log.info(
+            "listening on http://%s:%d (websocket at %s, REST at %s)",
+            args.host, args.port, WS_PATHS[0], REST_ROOT,
+        )
         if args.repl:
             await _repl(bridge)
         else:
-            await server_task
+            await asyncio.Event().wait()
     finally:
-        if rest is not None:
-            rest.stop()
-        server_task.cancel()
+        await runner.cleanup()
 
 
 def main(argv: Optional[list] = None) -> None:
-    parser = argparse.ArgumentParser(description="reddigg websocket bridge server")
-    parser.add_argument("--host", default=DEFAULT_HOST)
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
-    parser.add_argument(
-        "--rest-port",
-        type=int,
-        default=DEFAULT_REST_PORT,
-        help=f"port for the HTTP/REST API (default {DEFAULT_REST_PORT})",
+    p = argparse.ArgumentParser(description="reddigg server")
+    p.add_argument("--host", default=DEFAULT_HOST)
+    p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p.add_argument(
+        "--origin",
+        action="append",
+        help="regex of allowed websocket Origin (repeatable); "
+        f"default {DEFAULT_ORIGINS[0]!r}",
     )
-    parser.add_argument(
-        "--no-rest",
-        action="store_true",
-        help="do not start the HTTP/REST API",
-    )
-    parser.add_argument(
+    p.add_argument(
         "--repl",
         action="store_true",
         help="also start an interactive prompt to drive the API by hand",
     )
-    parser.add_argument(
-        "-v", "--verbose", action="store_true", help="debug logging"
-    )
-    args = parser.parse_args(argv)
-
+    p.add_argument("-v", "--verbose", action="store_true", help="debug logging")
+    args = p.parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",

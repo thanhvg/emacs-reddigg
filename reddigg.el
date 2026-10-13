@@ -4,7 +4,7 @@
 ;; Author: Thanh Vuong <thanhvg@gmail.com>
 ;; URL: https://github.com/thanhvg/emacs-reddigg
 ;; Package-Requires: ((emacs "26.3") (promise "1.1") (ht "2.3") (org "9.2") (json "1.4"))
-;; Version: 0.8.0
+;; Version: 0.9.0
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -32,6 +32,9 @@
 ;;   1. Run the server:  python3 server/reddigg_server.py
 ;;   2. Load userscript/reddigg-ws.user.js in your browser and be
 ;;      logged into old.reddit.com there.
+;; The server listens on a single port (1979) for both the userscript's
+;; websocket and Emacs's REST requests.  REST requests are authenticated
+;; with a token the server stores in `reddigg-token-file'.
 ;; See `reddigg-server-url' to point Emacs at a non-default host/port,
 ;; and `reddigg-ping' to check that the whole chain
 ;; (Emacs -> server -> browser tab) is working.
@@ -75,6 +78,7 @@
 (require 'promise)
 (require 'cl-lib)
 (require 'seq)
+(require 'subr-x)
 (require 'ht)
 (require 'org)
 (require 'json)
@@ -91,12 +95,22 @@
   :type 'list
   :group 'reddigg)
 
-(defcustom reddigg-server-url "http://127.0.0.1:1980/reddigg"
+(defcustom reddigg-server-url "http://127.0.0.1:1979/reddigg"
   "Base URL of the reddigg HTTP/REST server.
 The server (see server/reddigg_server.py) relays requests to a reddit
 tab running userscript/reddigg-ws.user.js.  The default matches the
-server's default --rest-port (1980)."
+server's default --port (1979), which serves both REST and websocket."
   :type 'string
+  :group 'reddigg)
+
+(defcustom reddigg-token-file
+  (or (getenv "REDDIGG_TOKEN_FILE")
+      (expand-file-name "reddigg/token"
+                        (or (getenv "XDG_CONFIG_HOME") "~/.config")))
+  "File holding the secret token the reddigg server requires.
+The server creates this file (mode 0600) on first start; it is sent
+as the X-Bridge-Token header on every request."
+  :type 'file
   :group 'reddigg)
 
 (defcustom reddigg-request-timeout 35
@@ -213,7 +227,19 @@ objects such as (error \"msg\") or (user-error \"msg\")."
 ;;   POST /reddigg/submit   {"subreddit","title","kind","text","url"}
 ;;
 ;; Every reply is either {"ok":true,"result":...} or {"error":"..."}
-;; (with a 4xx/5xx status on failure).
+;; (with a 4xx/5xx status on failure).  Every request must carry the
+;; token from `reddigg-token-file' in an X-Bridge-Token header.
+
+(defun reddigg--token ()
+  "Return the server auth token read from `reddigg-token-file'."
+  (let ((file (expand-file-name reddigg-token-file)))
+    (unless (file-readable-p file)
+      (error "reddigg: cannot read token file %s (start the server once to create it)"
+             file))
+    (string-trim
+     (with-temp-buffer
+       (insert-file-contents file)
+       (buffer-string)))))
 
 (defun reddigg--url-encode (s)
   "Percent-encode string S for use as a URL query value."
@@ -230,7 +256,8 @@ a string carrying the server's message on failure."
      (condition-case err
          (let* ((url-request-method method)
                 (url-request-extra-headers
-                 (when body '(("Content-Type" . "application/json"))))
+                 `(("X-Bridge-Token" . ,(reddigg--token))
+                   ,@(when body '(("Content-Type" . "application/json")))))
                 (url-request-data
                  (when body (encode-coding-string (json-encode body) 'utf-8)))
                 (buf (url-retrieve-synchronously url t t
