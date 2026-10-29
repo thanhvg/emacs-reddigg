@@ -9,6 +9,7 @@ in a logged-in reddit tab.  One port, one event loop (aiohttp):
     GET  http://127.0.0.1:1979/reddigg/ping
     GET  http://127.0.0.1:1979/reddigg/session
     GET  http://127.0.0.1:1979/reddigg/get?path=/r/emacs.json%3Fcount%3D25
+    GET  http://127.0.0.1:1979/reddigg/image?url=https%3A%2F%2Fi.redd.it%2Fabc.png
     POST http://127.0.0.1:1979/reddigg/vote     {"id": "t3_abc", "dir": 1}
     POST http://127.0.0.1:1979/reddigg/comment  {"parent": "t3_abc", "text": "hi"}
     POST http://127.0.0.1:1979/reddigg/edit     {"id": "t1_abc", "text": "..."}
@@ -96,13 +97,14 @@ ACTIONS = {
     "ping",
     "session",
     "get",
+    "image",
     "vote",
     "comment",
     "edit",
     "delete",
     "submit",
 }
-READ_ONLY = {"ping", "session", "get"}
+READ_ONLY = {"ping", "session", "get", "image"}
 WRITE = {"vote", "comment", "edit", "delete", "submit"}
 
 
@@ -385,6 +387,9 @@ def make_app(bridge: Bridge, token: str, origins: List[re.Pattern], port: int) -
                 # /reddigg/get?path=/r/emacs.json%3Fcount%3D5 : the whole reddit
                 # path (including its own query) arrives as one `path` value.
                 params["path"] = request.query.get("path", "")
+            elif action == "image":
+                # /reddigg/image?url=https%3A%2F%2Fi.redd.it%2Fabc.png
+                params["url"] = request.query.get("url", "")
 
         try:
             timeout = min(float(request.query.get("timeout") or 30), 120.0)

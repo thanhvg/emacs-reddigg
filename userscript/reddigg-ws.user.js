@@ -7,7 +7,8 @@
 // @match        https://old.reddit.com/*
 // @match        https://www.reddit.com/*
 // @match        https://reddit.com/*
-// @grant        none
+// @connect      i.redd.it
+// @connect      preview.redd.it
 // @run-at       document-idle
 // @connect      127.0.0.1
 // ==/UserScript==
@@ -218,6 +219,70 @@
     }
   }
 
+  // ---- image fetching ----------------------------------------------------
+
+  // Only reddit's own image hosts: the bridge must not become a general proxy.
+  const IMAGE_HOST_RE = /^(i|preview)\.redd\.it$/;
+  const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+
+  function bytesToBase64(buf) {
+    const bytes = new Uint8Array(buf);
+    let s = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    }
+    return btoa(s);
+  }
+
+  // Preferred path: GM_xmlhttpRequest is not subject to CORS and lets us
+  // send a reddit Referer, like a browser tab loading the image would.
+  function gmFetchBuffer(url) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url,
+        responseType: 'arraybuffer',
+        timeout: 25000,
+        headers: { Referer: 'https://www.reddit.com/' },
+        onload(res) {
+          if (res.status < 200 || res.status >= 300) {
+            reject(new Error(`HTTP ${res.status} for ${url}`));
+            return;
+          }
+          const m = /content-type:\s*([^\r\n;]+)/i.exec(res.responseHeaders || '');
+          resolve({ buf: res.response, type: m ? m[1].trim() : null });
+        },
+        onerror() { reject(new Error(`network error for ${url}`)); },
+        ontimeout() { reject(new Error(`timeout fetching ${url}`)); },
+      });
+    });
+  }
+
+  // Fallback when the script has `@grant none`: plain fetch, which only
+  // works if the image host sends CORS headers.
+  async function pageFetchBuffer(url) {
+    const r = await fetch(url, { credentials: 'omit', mode: 'cors' });
+    if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
+    return { buf: await r.arrayBuffer(), type: r.headers.get('content-type') };
+  }
+
+  async function fetchImage(url) {
+    let u;
+    try { u = new URL(url); } catch (_) { throw new Error('image: bad `url`'); }
+    if (u.protocol !== 'https:' || !IMAGE_HOST_RE.test(u.hostname)) {
+      throw new Error(`image: host not allowed: ${u.hostname}`);
+    }
+    const { buf, type } = await pageFetchBuffer(u.href);
+    if (type && !/^image\//i.test(type)) {
+      // reddit's bot-check page and friends come back as text/html
+      throw new Error(`image: got ${type}, not an image (blocked?)`);
+    }
+    if (buf.byteLength > MAX_IMAGE_BYTES) {
+      throw new Error(`image: too large (${buf.byteLength} bytes)`);
+    }
+    return { contentType: type, size: buf.byteLength, data: bytesToBase64(buf) };
+  }
+
   // ---- action handlers ---------------------------------------------------
 
   //
@@ -255,6 +320,16 @@
     async get({ path }) {
       if (!path) throw new Error('get: missing `path`');
       return jsonGet(path);
+    },
+
+    /**
+     * READ. Fetch an image from reddit's image hosts, base64-encoded.
+     * params: { url }  (e.g. "https://i.redd.it/abc123.png")
+     * result: { contentType, size, data }
+     */
+    async image({ url }) {
+      if (!url) throw new Error('image: missing `url`');
+      return fetchImage(url);
     },
 
     /**

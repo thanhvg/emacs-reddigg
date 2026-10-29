@@ -4,7 +4,7 @@
 ;; Author: Thanh Vuong <thanhvg@gmail.com>
 ;; URL: https://github.com/thanhvg/emacs-reddigg
 ;; Package-Requires: ((emacs "26.3") (promise "1.1") (ht "2.3") (org "9.2") (json "1.4"))
-;; Version: 0.9.0
+;; Version: 0.9.1
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -1060,13 +1060,14 @@ after deleting the current line which should be the More button."
            (insert "created: " (format-time-string "%Y-%m-%d" (gethash "created_utc" my-it)) "\n")
            (let ((selftext (gethash "selftext" my-it)) begin end)
              (if (or (null selftext) (string-empty-p selftext))
-                 (insert (format "%s \n[[eww:%s][view in eww]]\n"
-                                 (gethash "url" my-it) (gethash "url" my-it)))
+                 (insert (reddigg--link-post-line (gethash "url" my-it)))
                (setq begin (point-marker))
                (insert "\n" selftext "\n")
                (setq end (point-marker))
                (reddigg--sanitize-range begin end)
                (reddigg--mark-body-overlay begin end)))
+           (dolist (u (reddigg--gallery-urls my-it))
+             (insert u "\n"))
            (insert (format "[[elisp:(reddigg--view-comments \"%s\")][view comments]]\n"
                            (ht-get my-it "permalink")))))
        (ht-get data "children"))
@@ -1140,6 +1141,8 @@ Return the value of `reddigg--cmt-list-id'."
     (insert "author: " (ht-get cmt "author") " | ")
     (insert "created: " (reddigg--format-created (ht-get cmt "created_utc")) "\n")
     (insert (ht-get cmt "url") "\n")
+    (dolist (u (reddigg--gallery-urls cmt))
+      (insert u "\n"))
     (insert (format "[[elisp:(reddigg--view-comments \"%s\" t)][refresh]]\n"
                     (ht-get cmt "permalink")))
     (setq begin (point-marker))
@@ -1271,6 +1274,132 @@ SCOPE: hour, day, week, year, all."
                             (insert (format reddigg--template-sub sub sub)))
                           (reddigg--ensure-modes)
                           reddigg--main-buffer))))
+
+;;; --- images ----------------------------------------------------------------
+;;
+;; Reddit serves a bot-check page (HTML/JS) to anything that is not a real
+;; browser, so Emacs cannot fetch i.redd.it / preview.redd.it itself.  Images
+;; are fetched by the logged-in reddit tab instead (the server's `image'
+;; action) and come back base64-encoded.
+
+(defconst reddigg--image-url-regexp
+  "https://\\(?:i\\|preview\\)\\.redd\\.it/[^][ \t\n<>(),\"]+"
+  "Regexp matching reddit-hosted image URLs.")
+
+(defcustom reddigg-image-max-width 800
+  "Maximum pixel width of images shown by reddigg."
+  :type 'integer
+  :group 'reddigg)
+
+(defun reddigg--image-url-p (url)
+  "Return non-nil when URL is a reddit-hosted image URL."
+  (and (stringp url)
+       (string-match-p (concat "\\`" reddigg--image-url-regexp) url)))
+
+(defun reddigg--link-post-line (url)
+  "Return the org text that links a link post's URL."
+  (if (reddigg--image-url-p url)
+      (format "%s \n[[elisp:(reddigg-view-image \"%s\")][view image]]\n" url url)
+    (format "%s \n[[eww:%s][view in eww]]\n" url url)))
+
+(defun reddigg--gallery-urls (post)
+  "Return the direct image URLs of gallery POST, in gallery order."
+  (let ((meta (ht-get post "media_metadata"))
+        (gallery (ht-get post "gallery_data")))
+    (when (and (hash-table-p meta) (hash-table-p gallery))
+      (delq nil
+            (mapcar
+             (lambda (item)
+               (let* ((id (ht-get item "media_id"))
+                      (info (and id (ht-get meta id)))
+                      (mime (and (hash-table-p info) (ht-get info "m"))))
+                 (when (and (stringp mime) (string-match "/\\(.+\\)\\'" mime))
+                   (format "https://i.redd.it/%s.%s" id (match-string 1 mime)))))
+             (ht-get gallery "items"))))))
+
+(defun reddigg--fetch-image (url)
+  "Promise an image object for URL, fetched through the reddit tab."
+  (promise-then
+   (reddigg--http-request
+    "GET"
+    (format "%s/image?url=%s" reddigg-server-url (reddigg--url-encode url)))
+   (lambda (result)
+     (let ((data (base64-decode-string (ht-get result "data"))))
+       (create-image data nil t :max-width reddigg-image-max-width)))))
+
+(defun reddigg--image-url-at-point ()
+  "Return the reddit image URL at point, or nil."
+  (let ((url (thing-at-point 'url t)))
+    (and (reddigg--image-url-p url) url)))
+
+;;;###autoload
+(defun reddigg-view-image (url)
+  "View the reddit image at URL in a dedicated buffer."
+  (interactive
+   (list (or (reddigg--image-url-at-point)
+             (read-string "Image URL: "))))
+  (promise-chain (reddigg--fetch-image url)
+    (then (lambda (image)
+            (with-current-buffer (get-buffer-create "*reddigg-image*")
+              (special-mode)
+              (let ((inhibit-read-only t))
+                (erase-buffer)
+                (insert-image image)
+                (insert "\n" url "\n"))
+              (goto-char (point-min)))
+            (pop-to-buffer "*reddigg-image*")))
+    (promise-catch (lambda (reason)
+                     (message "reddigg: could not load image: %s"
+                              (reddigg--reason-string reason))))))
+
+(defun reddigg--browse-image (url &rest _)
+  "`browse-url-handlers' entry: open reddit image URL in reddigg."
+  (reddigg-view-image url))
+
+;; Enter / C-c C-o on an image link then opens it in reddigg (Emacs 28+).
+(when (boundp 'browse-url-handlers)
+  (add-to-list 'browse-url-handlers
+               (cons (concat "\\`" reddigg--image-url-regexp)
+                     #'reddigg--browse-image)))
+
+(defun reddigg--show-image-overlay (marker image)
+  "Show IMAGE in an overlay after MARKER, without touching the buffer text."
+  (when (buffer-live-p (marker-buffer marker))
+    (with-current-buffer (marker-buffer marker)
+      (remove-overlays marker marker 'reddigg-image t)
+      (let ((ov (make-overlay marker marker)))
+        (overlay-put ov 'reddigg-image t)
+        (overlay-put ov 'after-string
+                     (concat "\n" (propertize " " 'display image) "\n"))))))
+
+;;;###autoload
+(defun reddigg-inline-images (&optional beg end)
+  "Fetch and show every reddit image link between BEG and END inline.
+Interactively, use the region if active, else the whole (visible) buffer.
+Images are shown in overlays, so the post and comment text stays intact."
+  (interactive (when (use-region-p) (list (region-beginning) (region-end))))
+  (let ((beg (or beg (point-min)))
+        (end (or end (point-max)))
+        (found nil))
+    (save-excursion
+      (goto-char beg)
+      (while (re-search-forward reddigg--image-url-regexp end t)
+        (push (cons (copy-marker (match-end 0)) (match-string-no-properties 0))
+              found)))
+    (if (null found)
+        (message "reddigg: no reddit image links found")
+      (dolist (it (nreverse found))
+        (let ((marker (car it)))
+          (promise-chain (reddigg--fetch-image (cdr it))
+            (then (lambda (image) (reddigg--show-image-overlay marker image)))
+            (promise-catch (lambda (reason)
+                             (message "reddigg: could not load %s: %s"
+                                      (cdr it) (reddigg--reason-string reason))))))))))
+
+(defun reddigg-clear-inline-images ()
+  "Remove all inline images shown by `reddigg-inline-images'."
+  (interactive)
+  (remove-overlays nil nil 'reddigg-image t))
 
 (provide 'reddigg)
 ;;; reddigg.el ends here
