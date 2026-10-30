@@ -1199,7 +1199,10 @@ r/emacs/comments/lfww57/weekly_tipstricketc_thread/."
               (select-window
                (display-buffer
                 (reddigg--get-cmt-buffer)
-                '(display-buffer-use-some-window (inhibit-same-window . t)))))))
+                '((display-buffer-reuse-window display-buffer-in-direction)
+                  ;; (direction . right)
+                  (reusable-frames . nil)
+                  (inhibit-same-window . t)))))))
     (promise-catch (lambda (reason)
                      (message "reddigg: could not load comments: %s"
                               (reddigg--reason-string reason))))))
