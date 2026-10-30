@@ -22,7 +22,7 @@ Emacs  <--HTTP-->  server/reddigg_server.py  <--websocket-->  userscript in Redd
 #+end_example
 
 The tab performs the request with your own session, so no API keys are needed.
-* breaking change version 0.9.0: no longer depends on ~browser-gt~
+* breaking change version 0.9.0: no longer requires ~browser-gt~
 use ~browser-gt~ branch if you prefer it.
 
 * Requirements

@@ -1067,7 +1067,7 @@ after deleting the current line which should be the More button."
                (reddigg--sanitize-range begin end)
                (reddigg--mark-body-overlay begin end)))
            (dolist (u (reddigg--gallery-urls my-it))
-             (insert u "\n"))
+             (insert (format "%s \n[[elisp:(reddigg-view-image \"%s\")][view image]]\n" u u)))
            (insert (format "[[elisp:(reddigg--view-comments \"%s\")][view comments]]\n"
                            (ht-get my-it "permalink")))))
        (ht-get data "children"))
