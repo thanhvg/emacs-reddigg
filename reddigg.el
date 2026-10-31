@@ -4,7 +4,7 @@
 ;; Author: Thanh Vuong <thanhvg@gmail.com>
 ;; URL: https://github.com/thanhvg/emacs-reddigg
 ;; Package-Requires: ((emacs "26.3") (promise "1.1") (ht "2.3") (org "9.2") (json "1.4"))
-;; Version: 0.9.1
+;; Version: 0.9.2
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -1085,6 +1085,71 @@ after deleting the current line which should be the More button."
       (while (re-search-forward (car it) end t)
         (replace-match (cdr it))))))
 
+(defun reddigg--html-match (regexp html)
+  "Return the first group of REGEXP matched in HTML, or nil."
+  (when (and (stringp html) (string-match regexp html))
+    (match-string 1 html)))
+
+(defun reddigg--iso-time->epoch (s)
+  "Convert an ISO 8601 UTC timestamp string S to epoch seconds, or nil."
+  (when (and (stringp s)
+             (string-match
+              "\\([0-9]+\\)-\\([0-9]+\\)-\\([0-9]+\\)T\\([0-9]+\\):\\([0-9]+\\):\\([0-9]+\\)"
+              s))
+    (let ((n (lambda (i) (string-to-number (match-string i s)))))
+      (float-time (encode-time (funcall n 6) (funcall n 5) (funcall n 4)
+                               (funcall n 3) (funcall n 2) (funcall n 1)
+                               t)))))
+
+(defun reddigg--strip-tags (html)
+  "Crude HTML -> text for the fallback when \"contentText\" is missing."
+  (let ((text (replace-regexp-in-string "<[^>]*>" "" (or html ""))))
+    (dolist (e '(("&quot;" . "\"") ("&#39;" . "'") ("&lt;" . "<")
+                 ("&gt;" . ">") ("&amp;" . "&")))
+      (setq text (replace-regexp-in-string (car e) (cdr e) text t t)))
+    (string-trim text)))
+
+(defun reddigg--normalize-thing (thing)
+  "Return THING in the classic comment shape.
+The newer /api/morechildren response gives each comment as
+{\"kind\":\"t1\",\"data\":{\"id\",\"parent\",\"link\",\"content\",
+\"contentHTML\",\"contentText\",\"replies\"}} with no author, score,
+body, depth etc.  Rebuild those from the payload so the printer can
+stay unchanged.  Things already in the classic shape (and \"more\"
+stubs) are returned as they are."
+  (let ((data (ht-get thing "data")))
+    (if (or (not (hash-table-p data))
+            (equal (ht-get thing "kind") "more")
+            (ht-get data "body"))
+        thing
+      (let* ((html (ht-get data "content"))
+             (new (ht-copy data))
+             (entry (reddigg--html-match "class=\"entry \\([a-z]+\\)\"" html)))
+        (ht-set! new "name" (ht-get data "id"))
+        (ht-set! new "author"
+                 (or (reddigg--html-match "data-author=\"\\([^\"]+\\)\"" html)
+                     "[deleted]"))
+        (ht-set! new "subreddit"
+                 (reddigg--html-match "data-subreddit=\"\\([^\"]+\\)\"" html))
+        (ht-set! new "score"
+                 (let ((sc (reddigg--html-match
+                            "class=\"score unvoted\" title=\"\\(-?[0-9]+\\)\""
+                            html)))
+                   (and sc (string-to-number sc))))
+        (ht-set! new "created_utc"
+                 (reddigg--iso-time->epoch
+                  (reddigg--html-match "datetime=\"\\([^\"]+\\)\"" html)))
+        (ht-set! new "likes"
+                 (cond ((equal entry "likes") t)
+                       ((equal entry "dislikes") reddigg--json-false)))
+        (ht-set! new "body"
+                 (or (ht-get data "contentText")
+                     (reddigg--strip-tags (ht-get data "contentHTML"))))
+        (let ((out (ht-create)))
+          (ht-set! out "kind" (ht-get thing "kind"))
+          (ht-set! out "data" new)
+          out)))))
+
 (defun reddigg--print-comment-list (cmt-list level)
   "Print comments from CMT-LIST with LEVEL."
   (seq-do
@@ -1092,7 +1157,9 @@ after deleting the current line which should be the More button."
      (let* ((kind (ht-get it "kind"))
             (data (ht-get it "data"))
             (replies (ht-get data "replies"))
-            (depth (ht-get data "depth"))
+            ;; morechildren no longer returns "depth"; LEVEL is
+            ;; depth+1 stars, so derive it from that.
+            (depth (or (ht-get data "depth") (max 0 (1- (length level)))))
             (my-level (make-string (+ 2 depth) ?*))
             begin end)
        (if (string= kind "more")
@@ -1103,7 +1170,7 @@ after deleting the current line which should be the More button."
                            (mapconcat #'identity (ht-get data "children") ",")
                            (ht-get data "count")))
 
-         (insert my-level " " (ht-get data "author") "\n")
+         (insert my-level " " (or (ht-get data "author") "[deleted]") "\n")
          (insert ":PROPERTIES:\n")
          (insert (format ":REDDIGG_ID: %s\n" (ht-get data "name")))
          (insert (format ":REDDIGG_AUTHOR: %s\n" (ht-get data "author")))
@@ -1113,7 +1180,7 @@ after deleting the current line which should be the More button."
          (insert (format ":REDDIGG_CREATED: %s\n" (reddigg--format-created (ht-get data "created_utc"))))
          (insert ":END:\n")
          (setq begin (point-marker))
-         (insert (ht-get data "body") "\n")
+         (insert (or (ht-get data "body") "") "\n")
          (setq end (point-marker))
          (reddigg--sanitize-range begin end)
          (reddigg--mark-body-overlay begin end)
@@ -1236,7 +1303,8 @@ SCOPE: hour, day, week, year, all."
   "Get more comments from CHILDREN and print at LEVEL."
   (promise-chain (reddigg--promise-more-comments children)
     (then (lambda (result)
-            (ht-get* result "json" "data" "things")))
+            (seq-map #'reddigg--normalize-thing
+                     (ht-get* result "json" "data" "things"))))
     (then (lambda (result)
             (kill-whole-line)
             (save-excursion
