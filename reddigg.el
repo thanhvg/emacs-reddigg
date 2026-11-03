@@ -4,7 +4,7 @@
 ;; Author: Thanh Vuong <thanhvg@gmail.com>
 ;; URL: https://github.com/thanhvg/emacs-reddigg
 ;; Package-Requires: ((emacs "26.3") (promise "1.1") (ht "2.3") (org "9.2") (json "1.4"))
-;; Version: 0.9.2
+;; Version: 0.9.3
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -79,6 +79,10 @@
 (require 'cl-lib)
 (require 'seq)
 (require 'subr-x)
+(require 'dom)
+
+;; Org internals we bind dynamically in `reddigg--replace-more-line'.
+(defvar org-fold-core--ignore-fragility-checks)
 (require 'ht)
 (require 'org)
 (require 'json)
@@ -1085,11 +1089,6 @@ after deleting the current line which should be the More button."
       (while (re-search-forward (car it) end t)
         (replace-match (cdr it))))))
 
-(defun reddigg--html-match (regexp html)
-  "Return the first group of REGEXP matched in HTML, or nil."
-  (when (and (stringp html) (string-match regexp html))
-    (match-string 1 html)))
-
 (defun reddigg--iso-time->epoch (s)
   "Convert an ISO 8601 UTC timestamp string S to epoch seconds, or nil."
   (when (and (stringp s)
@@ -1101,54 +1100,97 @@ after deleting the current line which should be the More button."
                                (funcall n 3) (funcall n 2) (funcall n 1)
                                t)))))
 
-(defun reddigg--strip-tags (html)
-  "Crude HTML -> text for the fallback when \"contentText\" is missing."
-  (let ((text (replace-regexp-in-string "<[^>]*>" "" (or html ""))))
-    (dolist (e '(("&quot;" . "\"") ("&#39;" . "'") ("&lt;" . "<")
-                 ("&gt;" . ">") ("&amp;" . "&")))
-      (setq text (replace-regexp-in-string (car e) (cdr e) text t t)))
-    (string-trim text)))
+;; (defun reddigg--unescape-entities (s)
+;;   "Undo ONE level of HTML entity escaping in S.
+;; The \"content\" field of the morechildren response is an HTML fragment
+;; that was itself entity-escaped (\"&lt;div ...\").  This is a single
+;; pass, so \"&amp;#32;\" becomes \"&#32;\" and is left for the HTML parser."
+;;   (replace-regexp-in-string
+;;    "&\\(?:lt\\|gt\\|amp\\|quot\\|#39\\);"
+;;    (lambda (m)
+;;      (pcase m
+;;        ("&lt;" "<") ("&gt;" ">") ("&amp;" "&") ("&quot;" "\"") (_ "'")))
+;;    s t t))
+
+(defun reddigg--content->dom (content)
+  "Parse the escaped HTML fragment CONTENT into a DOM tree."
+  (unless (fboundp 'libxml-parse-html-region)
+    (user-error "reddigg: this Emacs lacks libxml2 support, needed to read more comments"))
+  (with-temp-buffer
+    (insert content)
+    (libxml-parse-html-region (point-min) (point-max))))
 
 (defun reddigg--normalize-thing (thing)
   "Return THING in the classic comment shape.
 The newer /api/morechildren response gives each comment as
 {\"kind\":\"t1\",\"data\":{\"id\",\"parent\",\"link\",\"content\",
 \"contentHTML\",\"contentText\",\"replies\"}} with no author, score,
-body, depth etc.  Rebuild those from the payload so the printer can
-stay unchanged.  Things already in the classic shape (and \"more\"
-stubs) are returned as they are."
+body, depth etc.  The metadata only lives in the HTML in \"content\",
+so parse that into a DOM and read it with the `dom' API.  Things
+already in the classic shape (and \"more\" stubs) are returned as is."
   (let ((data (ht-get thing "data")))
     (if (or (not (hash-table-p data))
             (equal (ht-get thing "kind") "more")
-            (ht-get data "body"))
+            (ht-get data "body")
+            (not (stringp (ht-get data "content"))))
         thing
-      (let* ((html (ht-get data "content"))
+      (let* ((dom (reddigg--content->dom (ht-get data "content")))
+             (node (car (dom-by-id dom "\\`thing_")))
+             (score (car (dom-by-class dom "\\`score unvoted\\'")))
+             (entry (car (dom-by-class dom "\\`entry ")))
+             (entry-state (and entry
+                               (cadr (split-string
+                                      (or (dom-attr entry 'class) "")))))
+             (time (car (dom-by-tag dom 'time)))
              (new (ht-copy data))
-             (entry (reddigg--html-match "class=\"entry \\([a-z]+\\)\"" html)))
+             (out (ht-create)))
         (ht-set! new "name" (ht-get data "id"))
-        (ht-set! new "author"
-                 (or (reddigg--html-match "data-author=\"\\([^\"]+\\)\"" html)
-                     "[deleted]"))
-        (ht-set! new "subreddit"
-                 (reddigg--html-match "data-subreddit=\"\\([^\"]+\\)\"" html))
-        (ht-set! new "score"
-                 (let ((sc (reddigg--html-match
-                            "class=\"score unvoted\" title=\"\\(-?[0-9]+\\)\""
-                            html)))
-                   (and sc (string-to-number sc))))
+        (ht-set! new "author" (or (and node (dom-attr node 'data-author))
+                                  "[deleted]"))
+        (ht-set! new "subreddit" (and node (dom-attr node 'data-subreddit)))
+        ;; no score node when the subreddit hides scores
+        (ht-set! new "score" (and score (dom-attr score 'title)
+                                  (string-to-number (dom-attr score 'title))))
         (ht-set! new "created_utc"
-                 (reddigg--iso-time->epoch
-                  (reddigg--html-match "datetime=\"\\([^\"]+\\)\"" html)))
-        (ht-set! new "likes"
-                 (cond ((equal entry "likes") t)
-                       ((equal entry "dislikes") reddigg--json-false)))
-        (ht-set! new "body"
-                 (or (ht-get data "contentText")
-                     (reddigg--strip-tags (ht-get data "contentHTML"))))
-        (let ((out (ht-create)))
-          (ht-set! out "kind" (ht-get thing "kind"))
-          (ht-set! out "data" new)
-          out)))))
+                 (and time (reddigg--iso-time->epoch (dom-attr time 'datetime))))
+        (ht-set! new "likes" (cond ((equal entry-state "likes") t)
+                                   ((equal entry-state "dislikes")
+                                    reddigg--json-false)))
+        (ht-set! new "body" (or (ht-get data "contentText") ""))
+        (ht-set! out "kind" (ht-get thing "kind"))
+        (ht-set! out "data" new)
+        out))))
+
+(defun reddigg--nest-things (things)
+  "Arrange the flat THINGS list into a tree by their \"parent\" ids.
+Return the roots (things whose parent is not in THINGS); each thing's
+\"replies\" is filled with a listing of its children so that
+`reddigg--print-comment-list' recurses into it."
+  (let ((ids (make-hash-table :test 'equal))
+        (kids (make-hash-table :test 'equal))
+        roots)
+    (seq-do (lambda (th)
+              (let ((id (ht-get* th "data" "name")))
+                (when id (puthash id t ids))))
+            things)
+    (seq-do (lambda (th)
+              (let ((parent (ht-get* th "data" "parent")))
+                (if (and parent (gethash parent ids))
+                    (puthash parent (append (gethash parent kids) (list th))
+                             kids)
+                  (push th roots))))
+            things)
+    (maphash (lambda (parent children)
+               (let ((th (seq-find (lambda (x)
+                                     (equal (ht-get* x "data" "name") parent))
+                                   things))
+                     (listing (ht-create))
+                     (ldata (ht-create)))
+                 (ht-set! ldata "children" (vconcat children))
+                 (ht-set! listing "data" ldata)
+                 (ht-set! (ht-get th "data") "replies" listing)))
+             kids)
+    (nreverse roots)))
 
 (defun reddigg--print-comment-list (cmt-list level)
   "Print comments from CMT-LIST with LEVEL."
@@ -1299,16 +1341,44 @@ SCOPE: hour, day, week, year, all."
                      (message "reddigg: could not load %s: %s"
                               sub (reddigg--reason-string reason))))))
 
+(defun reddigg--replace-more-line (things level)
+  "Replace the \"load more\" line at point with THINGS printed at LEVEL.
+Inserting right in front of the next heading makes org unfold that
+heading (the next sibling comment), so skip Org's fold fix-ups and, as
+a fallback for older Org versions, fold it again if it was folded."
+  (let* ((next (save-excursion
+                 (forward-line 1)
+                 (and (not (eobp))
+                      (org-at-heading-p)
+                      (copy-marker (point) t))))
+         (was-folded (and next
+                          (save-excursion
+                            (goto-char next)
+                            (invisible-p (line-end-position))))))
+    ;; Org >= 9.6 checks the folds next to an edit and queues an unfold
+    ;; for any it considers broken, to be run after the *next* command
+    ;; (that is why the neighbour used to open when you pressed a key).
+    ;; We only insert whole new subtrees, so skip that check.
+    (let ((org-fold-core--ignore-fragility-checks t))
+      (kill-whole-line)
+      (save-excursion
+        (reddigg--print-comment-list things level)))
+    (when next
+      (when was-folded
+        (save-excursion
+          (goto-char next)
+          (outline-hide-subtree)))
+      (set-marker next nil))))
+
 (defun reddigg--view-more-cmts (level children)
   "Get more comments from CHILDREN and print at LEVEL."
   (promise-chain (reddigg--promise-more-comments children)
     (then (lambda (result)
-            (seq-map #'reddigg--normalize-thing
-                     (ht-get* result "json" "data" "things"))))
+            (reddigg--nest-things
+             (seq-map #'reddigg--normalize-thing
+                      (ht-get* result "json" "data" "things")))))
     (then (lambda (result)
-            (kill-whole-line)
-            (save-excursion
-              (reddigg--print-comment-list result level))))
+            (reddigg--replace-more-line result level)))
     (promise-catch (lambda (reason)
                      (message "reddigg: could not load more comments: %s"
                               (reddigg--reason-string reason))))))
